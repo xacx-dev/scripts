@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Local, source-only Zabbix Agent 2 maintenance. No SSH or package installation.
+# Local Zabbix Agent 2 source build with APT prerequisites and a ready Go compiler.
 set +x
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 LAUNCH_DIR=$(pwd -P)
 WORK="$LAUNCH_DIR/.zabbix-agent2-work"
-PREFIX="$WORK/deps/prefix"
 TARGET_VERSION=7.0.32
 AUDIT=''
+APT_PREPARED=no
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ОШИБКА: %s\n' "$*" >&2; return 1; }
 worker_payload() {
-  cat <<'ZABBIX_AGENT2_EMBEDDED_WORKER_20261125'
+  cat <<'ZABBIX_AGENT2_READY_WORKER_20261125'
 #!/usr/bin/env bash
 set +x
-# Local source-only Zabbix operations. No package manager is invoked.
+# Local Zabbix source build/deployment; the controller manages system prerequisites.
 set -euo pipefail
 umask 077
 export LC_ALL=C
@@ -223,7 +223,7 @@ audit() {
     emit extra_features "$extra_features"
     emit sudo_noninteractive "$([[ $EUID -eq 0 ]] && printf yes || printf not-tested)"
     emit sudo_command "$(command -v sudo 2>/dev/null || true)"
-    emit package_installation prohibited
+    emit package_installation prerequisites_via_controller
 }
 workspace() {
     require_astra
@@ -246,11 +246,11 @@ build_agent() {
     [[ "$variant" == agent2 ]] || die 'This local installer builds Zabbix Agent2 only.'
     [[ -f "$dir/source.tar.gz" && ! -L "$dir/source.tar.gz" ]] || die 'Upload source.tar.gz into the workspace first.'
     [[ $(sha256sum "$dir/source.tar.gz" | awk '{print $1}') == "${source_sha,,}" ]] || die 'Source checksum mismatch.'
-    for tool in cc make tar; do command -v "$tool" >/dev/null || die "Missing build prerequisite: $tool. Package installation is prohibited.";done
+    for tool in cc make tar; do command -v "$tool" >/dev/null || die "Missing build prerequisite: $tool. Run prepare to install the build prerequisites.";done
     local go_banner go_version go_dir
-    command -v go >/dev/null || die 'Agent2 needs Go >= 1.25.12. Run the local source bootstrap before building.'
+    command -v go >/dev/null || die 'Agent2 needs Go >= 1.25.12. Run prepare to download the local Go runtime.'
     go_banner=$(go version 2>/dev/null || true)
-    [[ "$go_banner" =~ go([0-9]+\.[0-9]+\.[0-9]+) ]] || die 'The command named go is not a supported Go compiler. Run the source bootstrap.'
+    [[ "$go_banner" =~ go([0-9]+\.[0-9]+\.[0-9]+) ]] || die 'The command named go is not a supported Go compiler. Run prepare to download Go.'
     go_version=${BASH_REMATCH[1]}
     [[ $(printf '%s\n' 1.25.12 "$go_version" | sort -V | head -n 1) == 1.25.12 ]] || die 'Go >= 1.25.12 is required; automatic binary-toolchain downloads are disabled.'
     for go_dir in "$root/go" "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR";do
@@ -268,30 +268,20 @@ build_agent() {
     [[ ${#candidates[@]} -eq 1 ]] || die 'Archive must contain exactly one source release with configure.'
     source=$(dirname "${candidates[0]}")
     [[ -f "$source/src/go/go.mod" && -f "$source/src/go/vendor/modules.txt" ]] || die 'Agent2 source archive must include its vendored Go source dependencies.'
-    local configure_flags=(--prefix=/usr/local --sysconfdir=/etc/zabbix --enable-ipv6)
-    if [[ -n "$deps" ]]; then
-        safe_path "$deps" && [[ "$deps" == "$root"/deps/prefix && -d "$deps" && ! -L "$deps" && $(canonical "$deps") == "$deps" ]] || die 'Invalid local dependency prefix.'
-        for item in include/pcre2.h include/openssl/ssl.h lib/libpcre2-8.a lib/libssl.a lib/libcrypto.a;do
-            [[ -f "$deps/$item" && ! -L "$deps/$item" ]] || die "Missing locally built dependency: $item"
-        done
-        configure_flags+=("--with-libpcre2=$deps" "--with-openssl=$deps")
-    else
-        configure_flags+=(--with-libpcre2 --with-openssl)
-    fi
-    if [[ "$variant" == classic ]];then configure_flags+=(--enable-agent);name=zabbix_agentd;else configure_flags+=(--enable-agent2);name=zabbix_agent2;fi
+    [[ -z "$deps" ]] || die 'This version builds only Zabbix and uses system OpenSSL/PCRE2; private source-built prefixes are not accepted.'
+    local configure_flags=(--prefix=/usr/local --sysconfdir=/etc/zabbix --enable-ipv6 --with-libpcre2 --with-openssl --enable-agent2)
+    name=zabbix_agent2
     local log="$dir/build.log"
     # No make install. Go is offline and may use only existing local modules/toolchain.
-    if ! (cd "$source"; export TMPDIR="$root/tmp" GOPROXY=off GOTOOLCHAIN=local GOSUMDB=off GOFLAGS="-mod=vendor -p=$jobs -buildvcs=false" GOMAXPROCS="$jobs" GOAMD64=v1 CGO_ENABLED=1 CFLAGS='-O2' CXXFLAGS='-O2'; unset GOARCH GOOS LD_LIBRARY_PATH LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH GOROOT GOROOT_BOOTSTRAP; if [[ -n "$deps" ]];then export PATH="$deps/bin:$PATH" CPPFLAGS="-I$deps/include" LDFLAGS="-L$deps/lib" LIBS='-ldl -lpthread' PKG_CONFIG_PATH="$deps/lib/pkgconfig" PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig";fi; ./configure "${configure_flags[@]}" && make -j "$jobs") >"$log" 2>&1; then
-        begin;emit build_log "$log";die 'Source compilation failed. Inspect the private build.log; missing dependencies are not installed automatically.'
+    if ! (cd "$source"; export TMPDIR="$root/tmp" GOPROXY=off GOTOOLCHAIN=local GOSUMDB=off GOFLAGS="-mod=vendor -p=$jobs -buildvcs=false" GOMAXPROCS="$jobs" GOAMD64=v1 CGO_ENABLED=1 CFLAGS='-O2' CXXFLAGS='-O2'; unset GOARCH GOOS LD_LIBRARY_PATH LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH GOROOT GOROOT_BOOTSTRAP CPPFLAGS LDFLAGS LIBS PKG_CONFIG_PATH PKG_CONFIG_LIBDIR CGO_CFLAGS CGO_CPPFLAGS CGO_LDFLAGS; ./configure "${configure_flags[@]}" && make -j "$jobs") >"$log" 2>&1; then
+        begin;emit build_log "$log";die 'Zabbix source compilation failed. Inspect build.log and the prerequisite installation log.'
     fi
-    if [[ "$variant" == classic ]];then output="$source/src/zabbix_agent/zabbix_agentd";else output="$source/src/go/bin/zabbix_agent2";fi
+    output="$source/src/go/bin/zabbix_agent2"
     [[ -x "$output" ]] || die 'Build completed without the expected agent binary.'
-    if [[ -n "$deps" ]];then
-        local dynamic
-        command -v ldd >/dev/null || die 'Cannot verify runtime library dependencies: existing ldd is required.'
-        dynamic=$(ldd "$output" 2>&1 || true)
-        [[ "$dynamic" != *'not found'* && "$dynamic" != *"$root"* && "$dynamic" != *libpcre2-* && "$dynamic" != *libssl.so* && "$dynamic" != *libcrypto.so* ]] || die 'Agent still depends on external/private PCRE2 or OpenSSL libraries. Inspect build.log.'
-    fi
+    local dynamic
+    command -v ldd >/dev/null || die 'Cannot verify runtime library dependencies: ldd is required.'
+    dynamic=$(ldd "$output" 2>&1 || true)
+    [[ "$dynamic" != *'not found'* && "$dynamic" != *"$root"* ]] || die 'Agent has a missing runtime library or still depends on the private work directory. Inspect build.log.'
     [[ $(variant_of "$output") == "$variant" && $(version_of "$output") == "$version" ]] || die 'Built binary reports an unexpected release or agent type.'
     cp -- "$output" "$dir/artifact/$name"
     chmod 0755 "$dir/artifact/$name"
@@ -306,7 +296,7 @@ build_agent() {
     emit astra_build "$(cat /etc/astra/build_version 2>/dev/null || true)"
     emit architecture "$(uname -m)";emit glibc "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
     emit library_fingerprint "$(library_fingerprint)"
-    emit package_installation prohibited
+    emit package_installation prerequisites_via_controller
 }
 
 metadata_set() { printf '%s' "$2" | base64 | tr -d '\n' >"$1";printf '\n' >>"$1";chmod 0600 "$1"; }
@@ -370,61 +360,21 @@ snapshot_configs() {
     if [[ -f "$config" ]];then cp -a -- "$config" "$backup/config.previous";fi
 }
 copy_existing_metadata() {
-    local original=$1 staged=$2 attrs='' helper_dir=$3
+    local original=$1 staged=$2 attrs='' copied='' expected='' actual=''
+    command -v getfattr >/dev/null && command -v setfattr >/dev/null || die 'The attr package is required to preserve binary metadata. Run prepare.'
+    attrs=$(getfattr -d -m - -e base64 --absolute-names -- "$original" 2>/dev/null) || die 'Cannot inspect the existing binary extended attributes.'
+    if printf '%s\n' "$attrs" | grep -Eiq '^[^#=]*(ima|evm|digsig|bsign|capability)[^=]*=';then
+        die 'Existing binary carries a signature or capability attribute. Use the approved signing/capability workflow before replacement.'
+    fi
     chown --reference="$original" "$staged"
     chmod --reference="$original" "$staged"
-    if command -v getfattr >/dev/null && command -v setfattr >/dev/null;then
-        attrs=$(getfattr -d -m - --absolute-names -- "$original" 2>/dev/null) || die 'Cannot inspect the existing binary extended attributes.'
-        # Old content signatures/capability grants must not be copied onto a
-        # different ELF. Signed installations need their approved signing flow.
-        if printf '%s\n' "$attrs" | grep -Eiq '^[^#=]*(ima|evm|digsig|bsign|capability)[^=]*=';then
-            die 'Existing binary carries a signature or capability attribute. Use the approved signing/capability workflow before replacement.'
-        fi
-        if [[ -n "$attrs" ]];then
-            printf '%s\n' "$attrs" | awk -v path="$staged" '/^# file:/ {print "# file: " path; next} {print}' | setfattr --restore=-
-        fi
-    else
-        # The deployment already requires a compiler for source builds. When
-        # attribute utilities are absent, build this small metadata helper from
-        # the embedded source; never install or download a utility package.
-        command -v cc >/dev/null || die 'Cannot safely inspect/copy extended attributes: neither installed attribute utilities nor a C compiler are available.'
-        cat >"$helper_dir/metadata-copy.c" <<'C_SOURCE'
-#define _GNU_SOURCE
-#include <sys/xattr.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-static void fail(const char *s){perror(s);exit(1);}
-int main(int argc,char **argv){
-  if(argc!=3)return 2;
-  ssize_t n=listxattr(argv[1],NULL,0);
-  if(n<0){if(errno==ENOTSUP||errno==EOPNOTSUPP)return 0;fail("listxattr");}
-  if(!n)return 0;
-  char *names=malloc((size_t)n);if(!names)fail("malloc");
-  n=listxattr(argv[1],names,(size_t)n);if(n<0)fail("listxattr");
-  for(char *p=names;p<names+n;p+=strlen(p)+1){
-    if(strcasestr(p,"digsig")||strcasestr(p,"bsign")||strcasestr(p,"capability")||
-       !strcasecmp(p,"security.ima")||!strcasecmp(p,"security.evm")){
-      fprintf(stderr,"Protected signature/capability attribute requires approved signing workflow: %s\n",p);return 1;
-    }
-    ssize_t z=getxattr(argv[1],p,NULL,0);if(z<0)fail("getxattr");
-    void *value=malloc((size_t)z+1);if(!value)fail("malloc");
-    if(getxattr(argv[1],p,value,(size_t)z)!=z)fail("getxattr");
-    if(setxattr(argv[2],p,value,(size_t)z,0))fail("setxattr");
-    ssize_t actual=getxattr(argv[2],p,NULL,0);if(actual!=z){fprintf(stderr,"Attribute size verification failed\n");return 1;}
-    void *check=malloc((size_t)z+1);if(!check)fail("malloc");
-    if(getxattr(argv[2],p,check,(size_t)z)!=z||memcmp(value,check,(size_t)z)){fprintf(stderr,"Attribute verification failed\n");return 1;}
-    free(value);free(check);
-  }
-  free(names);return 0;
-}
-C_SOURCE
-        TMPDIR="$helper_dir" cc -O2 -o "$helper_dir/metadata-copy" "$helper_dir/metadata-copy.c" >"$helper_dir/metadata-build.log" 2>&1 || die 'Cannot compile the embedded attribute helper; original binary remains unchanged.'
-        chmod 0700 "$helper_dir/metadata-copy"
-        "$helper_dir/metadata-copy" "$original" "$staged" || die 'Cannot safely copy/verify original extended attributes; original binary remains unchanged.'
+    if [[ -n "$attrs" ]];then
+        printf '%s\n' "$attrs" | awk -v path="$staged" '/^# file:/ {print "# file: " path; next} {print}' | setfattr --restore=-
     fi
+    copied=$(getfattr -d -m - -e base64 --absolute-names -- "$staged" 2>/dev/null) || die 'Cannot verify the staged binary extended attributes.'
+    expected=$(printf '%s\n' "$attrs" | awk 'NF && $0 !~ /^#/' | sort)
+    actual=$(printf '%s\n' "$copied" | awk 'NF && $0 !~ /^#/' | sort)
+    [[ "$expected" == "$actual" ]] || die 'Extended attribute verification failed; the original binary remains unchanged.'
 }
 deployment_exit() {
     local rc=$1 rollback_rc=0
@@ -843,13 +793,13 @@ case "$action" in
     status) status_agent "$@" ;;
     *) begin;die 'Unknown remote action.' ;;
 esac
-ZABBIX_AGENT2_EMBEDDED_WORKER_20261125
+ZABBIX_AGENT2_READY_WORKER_20261125
 }
 run_worker() { worker_payload | ZABBIX_LOCAL_WORK_ROOT="$WORK" bash -s -- "$@"; }
 go_builder_payload() {
-  cat <<'ZABBIX_AGENT2_EMBEDDED_GOBUILDER_20261125'
+  cat <<'ZABBIX_AGENT2_READY_GO_20261125'
 #!/usr/bin/env bash
-# Build the Go compiler from verified source archives only, inside the local work tree.
+# Obtain the official ready-made Go toolchain inside the local work tree.
 set +x
 set -Eeuo pipefail
 umask 077
@@ -871,157 +821,116 @@ go_version() {
 }
 validate_work() {
   safe_path "$WORK" && [[ -d $WORK && ! -L $WORK ]] || die 'Некорректный локальный рабочий каталог.'
-  [[ $(readlink -f -- "$WORK") == "$WORK" && $(stat -c %u -- "$WORK") == "$EUID" && $(stat -c %a -- "$WORK") == 700 ]] || die 'Рабочий каталог должен быть каноническим, принадлежать текущей учётной записи и иметь права 0700.'
+  [[ $(readlink -f -- "$WORK") == "$WORK" && $(stat -c %u -- "$WORK") == "$EUID" && $(stat -c %a -- "$WORK") == 700 ]] || die 'Рабочий каталог должен принадлежать текущей учётной записи и иметь права 0700.'
   local sub
-  for sub in sources toolchains logs tmp caches deps; do
+  for sub in downloads toolchains logs tmp go go/cache go/mod go/path;do
     [[ ! -L $WORK/$sub ]] || die "Символическая ссылка вместо рабочего каталога $sub."
     mkdir -p -- "$WORK/$sub"; chmod 700 "$WORK/$sub"
     [[ $(stat -c %u -- "$WORK/$sub") == "$EUID" ]] || die "Каталог $sub принадлежит другому пользователю."
   done
-  for sub in caches/go-build deps/gopath deps/gomod tmp/go; do
-    [[ ! -L $WORK/$sub ]] || die "Символическая ссылка вместо рабочего каталога $sub."
-    mkdir -p -- "$WORK/$sub"; chmod 700 "$WORK/$sub"
-  done
   export GOENV=off GOTOOLCHAIN=local GOTELEMETRY=off GOPROXY=off GOSUMDB=off
-  export GOCACHE="$WORK/caches/go-build" GOPATH="$WORK/deps/gopath" GOMODCACHE="$WORK/deps/gomod"
-  export GOTMPDIR="$WORK/tmp/go" TMPDIR="$WORK/tmp" GOAMD64=v1 GOMAXPROCS=2
+  export GOCACHE="$WORK/go/cache" GOMODCACHE="$WORK/go/mod" GOPATH="$WORK/go/path" GOTMPDIR="$WORK/tmp" TMPDIR="$WORK/tmp"
   unset GOROOT GOROOT_BOOTSTRAP GOBIN GOOS GOARCH GOFLAGS GOEXPERIMENT GO_GCFLAGS GO_LDFLAGS
 }
-
-# name, release version, minimal bootstrap version, SHA-256. Sources only.
-manifest() {
-  cat <<'MANIFEST'
-go1.4-bootstrap-20171003.tar.gz	1.4	c	f4ff5b5eb3a3cae1c993723f3eab519c5bae18866b5e5f96fe1102f0cb5c3e52
-go1.17.13.src.tar.gz	1.17.13	1.4	a1a48b23afb206f95e7bbaa9b898d965f90826f6f1d1fc0c1d784ada0cd300fd
-go1.20.14.src.tar.gz	1.20.14	1.17.13	1aef321a0e3e38b7e91d2d7eb64040666cabdcc77d383de3c9522d0d69b67f4e
-go1.22.12.src.tar.gz	1.22.12	1.20.14	012a7e1f37f362c0918c1dfa3334458ac2da1628c4b9cf4d9ca02db986e17d71
-go1.25.12.src.tar.gz	1.25.12	1.22.6	f90dcee4bd023fa376374ea0a5a6ebe553537b39c426ffd8c689469b45519932
-MANIFEST
-}
-download_source() {
-  local filename=$1 expected=$2 archive="$WORK/sources/$1" nearby="$(dirname -- "$WORK")/$1" temp
-  [[ $filename == go1.4-bootstrap-20171003.tar.gz || $filename =~ ^go1\.[0-9]+\.[0-9]+\.src\.tar\.gz$ ]] || die 'Разрешены только архивы исходников Go.'
-  [[ $expected =~ ^[a-f0-9]{64}$ ]] || die 'Встроенная SHA-256 исходников Go отсутствует.'
-  if [[ -e $archive || -L $archive ]]; then
-    [[ -f $archive && ! -L $archive && $(sha256sum -- "$archive" | awk '{print $1}') == "$expected" ]] || die "Повреждён локальный архив $filename."
-    printf '%s' "$archive"; return
-  fi
-  if [[ -e $nearby || -L $nearby ]]; then
-    [[ -f $nearby && ! -L $nearby && $(sha256sum -- "$nearby" | awk '{print $1}') == "$expected" ]] || die "SHA-256 перенесённого архива $filename не совпадает."
-    cp -- "$nearby" "$archive"; chmod 400 "$archive"
-    printf '%s' "$archive"; return
-  fi
-  temp=$(mktemp "$WORK/sources/go-download.XXXXXXXX")
-  progress "Скачивание исходников $filename в $WORK/sources"
-  if command -v curl >/dev/null; then
-    if ! curl --disable --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 900 --retry 1 --output "$temp" -- "https://dl.google.com/go/$filename"; then
-      rm -f -- "$temp"; die "Не удалось скачать $filename. Можно перенести официальный исходный архив через RDP в каталог запуска."
-    fi
-  elif command -v wget >/dev/null; then
-    if ! wget --https-only --timeout=15 --tries=2 --output-document="$temp" -- "https://dl.google.com/go/$filename"; then rm -f -- "$temp"; die "Не удалось скачать $filename."; fi
-  else rm -f -- "$temp"; die "Нет curl/wget. Перенесите исходный $filename через RDP; пакеты не устанавливаются."; fi
-  [[ $(sha256sum -- "$temp" | awk '{print $1}') == "$expected" ]] || { rm -f -- "$temp"; die "SHA-256 $filename не совпадает."; }
-  chmod 400 "$temp"; mv -- "$temp" "$archive"
-  printf '%s' "$archive"
+select_archive() {
+  [[ $(uname -s) == Linux ]] || die 'Готовый Go в этом скрипте рассчитан на Linux.'
+  case $(uname -m) in
+    x86_64|amd64) GO_ARCH=amd64; GO_SHA=234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1;;
+    aarch64|arm64) GO_ARCH=arm64; GO_SHA=8b5884aef89600aef5b0b051fb971f11f49bb996521e911f30f02a66884f7bd2;;
+    i?86) GO_ARCH=386; GO_SHA=b71e88ae779850dc2afcd0f2e2208798652311dfda72fdef5d05721d601b8fd3;;
+    *) die 'Для этой архитектуры нет закреплённого готового Go. Требуется совместимый существующий Go >= 1.25.12.';;
+  esac
+  GO_FILENAME="go$MIN_GO.linux-$GO_ARCH.tar.gz"
 }
 find_existing() {
   local path version best='' best_version=''
-  while IFS= read -r path; do
+  while IFS= read -r path;do
     [[ $path == /* && -x $path && -f $path ]] || continue
     version=$(go_version "$path") || continue
+    version_ge "$version" "$MIN_GO" || continue
     if [[ -z $best || $(printf '%s\n%s\n' "$best_version" "$version" | sort -V | tail -n 1) == "$version" ]];then best=$path;best_version=$version;fi
   done < <(type -a -P go 2>/dev/null | awk '!seen[$0]++' || true)
-  if [[ -n $best ]];then printf '%s' "$best";fi
+  [[ -z $best ]] || printf '%s' "$best"
+}
+download_archive() {
+  local archive="$WORK/downloads/$GO_FILENAME" nearby="$(dirname -- "$WORK")/$GO_FILENAME" temp
+  if [[ -e $archive || -L $archive ]];then
+    [[ -f $archive && ! -L $archive && $(sha256sum -- "$archive" | awk '{print $1}') == "$GO_SHA" ]] || die "Повреждён локальный архив $GO_FILENAME."
+    printf '%s' "$archive";return
+  fi
+  if [[ -e $nearby || -L $nearby ]];then
+    [[ -f $nearby && ! -L $nearby && $(sha256sum -- "$nearby" | awk '{print $1}') == "$GO_SHA" ]] || die "SHA-256 перенесённого архива $GO_FILENAME не совпадает."
+    cp -- "$nearby" "$archive";chmod 400 "$archive"
+    printf '%s' "$archive";return
+  fi
+  temp=$(mktemp "$WORK/downloads/go-download.XXXXXXXX")
+  progress "Скачивание готового Go $MIN_GO ($GO_ARCH) в $WORK/downloads"
+  if command -v curl >/dev/null;then
+    if ! curl --disable --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 900 --retry 1 --output "$temp" -- "https://dl.google.com/go/$GO_FILENAME";then
+      rm -f -- "$temp";die "Не удалось скачать $GO_FILENAME. Можно перенести этот официальный архив через RDP в каталог запуска."
+    fi
+  elif command -v wget >/dev/null;then
+    if ! wget --https-only --timeout=15 --tries=2 --output-document="$temp" -- "https://dl.google.com/go/$GO_FILENAME";then rm -f -- "$temp";die "Не удалось скачать $GO_FILENAME.";fi
+  else rm -f -- "$temp";die "Нет curl/wget. Выполните подготовку пакетов либо перенесите $GO_FILENAME через RDP.";fi
+  [[ $(sha256sum -- "$temp" | awk '{print $1}') == "$GO_SHA" ]] || { rm -f -- "$temp";die "SHA-256 $GO_FILENAME не совпадает."; }
+  chmod 400 "$temp";mv -- "$temp" "$archive"
+  printf '%s' "$archive"
 }
 proof_text() {
-  local sha=$1 dir=$2
-  printf '%s\n' "$sha" "$(uname -s)" "$(uname -m)" "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)" "$dir" "$(sha256sum -- "$dir/go/bin/go" | awk '{print $1}')"
+  local dir=$1
+  printf '%s\n' "$GO_FILENAME" "$GO_SHA" "$(uname -s)" "$(uname -m)" "$dir" "$(sha256sum -- "$dir/go/bin/go" | awk '{print $1}')"
 }
-cached_stage() {
-  local filename=$1 version=$2 sha=$3 dir="$WORK/toolchains/${1%.tar.gz}" reported
-  [[ -d $dir && ! -L $dir && $(readlink -f -- "$dir") == "$dir" && -r $dir/.source-built && ! -L $dir/.source-built && -x $dir/go/bin/go ]] || return 1
-  [[ $(cat -- "$dir/.source-built") == "$(proof_text "$sha" "$dir")" ]] || return 1
+cached_binary() {
+  local dir=$1 reported
+  [[ -d $dir && ! -L $dir && $(readlink -f -- "$dir") == "$dir" && -r $dir/.prebuilt-proof && ! -L $dir/.prebuilt-proof && -x $dir/go/bin/go && ! -L $dir/go/bin/go ]] || return 1
+  [[ $(readlink -f -- "$dir/go/bin/go") == "$dir/go/bin/go" && -x $dir/go/pkg/tool/linux_$GO_ARCH/compile && -x $dir/go/pkg/tool/linux_$GO_ARCH/link ]] || return 1
+  [[ $(cat -- "$dir/.prebuilt-proof") == "$(proof_text "$dir")" ]] || return 1
   reported=$(go_version "$dir/go/bin/go") || return 1
-  if [[ $filename == go1.4-bootstrap-20171003.tar.gz ]];then [[ $reported == 1.4 || $reported == 1.4.* ]] || return 1
-  else [[ $reported == "$version" ]] || return 1;fi
+  [[ $reported == "$MIN_GO" ]] || return 1
   printf '%s' "$dir/go/bin/go"
 }
-extract_source() {
-  local archive=$1 destination=$2
-  tar -tzf "$archive" | awk '/^\// {bad=1} /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || die 'Опасный путь в исходном архиве Go.'
-  if tar -tvzf "$archive" | awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {bad=1} END{exit !bad}';then die 'Ссылки и специальные файлы в исходном архиве Go не разрешены.';fi
-  tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$destination"
-  [[ -f $destination/go/src/make.bash && ! -L $destination/go/src/make.bash ]] || die 'Архив Go не содержит go/src/make.bash.'
-}
-build_stage() {
-  local filename=$1 version=$2 sha=$3 bootstrap=$4 archive dir log reported previous
-  archive=$(set -Eeuo pipefail; download_source "$filename" "$sha")
-  dir="$WORK/toolchains/${filename%.tar.gz}"
-  [[ ! -L $dir ]] || die 'Каталог компилятора не должен быть ссылкой.'
+unpack_archive() {
+  local archive=$1 dir=$2 temp previous reported
+  tar -tzf "$archive" | awk '/^\// {bad=1} /(^|\/)\.\.($|\/)/ {bad=1} END {exit bad}' || die 'Опасный путь в архиве готового Go.'
+  if tar -tvzf "$archive" | awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {bad=1} END{exit !bad}';then die 'Ссылки и специальные файлы в архиве Go не разрешены.';fi
+  [[ ! -L $dir ]] || die 'Каталог готового Go не должен быть символической ссылкой.'
+  temp=$(mktemp -d "$WORK/toolchains/go-unpack.XXXXXXXX")
+  tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$temp"
+  [[ -x $temp/go/bin/go && -f $temp/go/bin/go && ! -L $temp/go/bin/go ]] || die 'Архив Go не содержит исполняемый go/bin/go.'
+  reported=$(go_version "$temp/go/bin/go") || die 'Готовый Go не запускается: проверьте архитектуру и разрешение выполнения в каталоге.'
+  [[ $reported == "$MIN_GO" ]] || die "В архиве Go $reported вместо $MIN_GO."
   if [[ -e $dir ]];then
-    previous=$(mktemp -d "$WORK/toolchains/failed-stage.XXXXXXXX")
-    mv -- "$dir" "$previous/source-tree"
+    previous=$(mktemp -d "$WORK/toolchains/previous-go.XXXXXXXX")
+    mv -- "$dir" "$previous/toolchain"
   fi
-  mkdir -m 0700 -- "$dir"
-  extract_source "$archive" "$dir"
-  log="$WORK/logs/${filename%.tar.gz}.log"
-  progress "Сборка Go $version из исходников; журнал $log. Установка пакетов не выполняется."
-  if [[ $filename == go1.4-bootstrap-20171003.tar.gz ]];then
-    if ! (cd "$dir/go/src"; export CGO_ENABLED=0 CC='cc -fcommon' GO111MODULE=off; unset GOROOT_BOOTSTRAP; bash ./make.bash) >"$log" 2>&1;then die "C bootstrap Go не собран. Журнал: $log";fi
-  else
-    [[ -n $bootstrap && -x $bootstrap ]] || die "Не найден исходный bootstrap-компилятор для Go $version."
-    local bootstrap_root
-    bootstrap_root=$("$bootstrap" env GOROOT 2>/dev/null) || die 'Не удалось получить корень bootstrap Go.'
-    safe_path "$bootstrap_root" && [[ -d $bootstrap_root ]] || die 'Некорректный корень bootstrap Go.'
-    if ! (cd "$dir/go/src"; export GOROOT_BOOTSTRAP="$bootstrap_root" CGO_ENABLED=1 CC=cc GO111MODULE=off; bash ./make.bash) >"$log" 2>&1;then die "Go $version не собран из исходников. Журнал: $log";fi
-  fi
-  reported=$(go_version "$dir/go/bin/go") || die "Go $version не сообщает корректную версию."
-  if [[ $filename == go1.4-bootstrap-20171003.tar.gz ]];then [[ $reported == 1.4 || $reported == 1.4.* ]] || die 'Неправильная версия C bootstrap Go.'
-  else [[ $reported == "$version" ]] || die "Собран Go $reported вместо $version.";fi
-  proof_text "$sha" "$dir" >"$dir/.source-built"
-  chmod 600 "$dir/.source-built"
+  mv -- "$temp" "$dir"
+  proof_text "$dir" >"$dir/.prebuilt-proof"
+  chmod 600 "$dir/.prebuilt-proof"
   printf '%s' "$dir/go/bin/go"
 }
 run() {
-  local action=${1-} candidate='' candidate_version='' filename version minimum sha cached
-  [[ $action == prepare || $action == ensure ]] || die 'Внутренние команды Go: prepare либо ensure. Без команды сборка не запускается.'
+  local action=${1-} candidate archive dir
+  [[ $action == prepare || $action == ensure ]] || die 'Внутренние команды готового Go: prepare либо ensure. Без команды установка не запускается.'
   validate_work
   candidate=$(find_existing)
-  if [[ -n $candidate ]];then candidate_version=$(go_version "$candidate");fi
-  if [[ -n $candidate_version ]] && version_ge "$candidate_version" "$MIN_GO";then
-    begin;emit go_binary "$candidate";emit go_version "$candidate_version";emit go_origin existing;return
-  fi
-  [[ $(uname -s) == Linux ]] || die 'Source bootstrap Go рассчитан на Linux.'
-  if [[ -z $candidate ]];then
-    case $(uname -m) in x86_64|i?86|armv6l|armv7l) ;; *) die 'C bootstrap Go 1.4 не поддерживает эту архитектуру. Нужен уже имеющийся совместимый Go, собранный из исходников.';;esac
-  fi
-  if [[ $action == ensure ]];then
-    local tool
-    for tool in cc make tar sha256sum;do command -v "$tool" >/dev/null || die "Отсутствует $tool; установка пакетов запрещена.";done
-  fi
-  while IFS=$'\t' read -r filename version minimum sha;do
-    [[ -n $filename ]] || continue
-    if [[ -n $candidate_version ]] && version_ge "$candidate_version" "$version";then continue;fi
-    if [[ $action == prepare ]];then download_source "$filename" "$sha" >/dev/null;continue;fi
-    cached=$(cached_stage "$filename" "$version" "$sha") || cached=''
-    if [[ -n $cached ]];then candidate=$cached;candidate_version=$(go_version "$candidate");continue;fi
-    if [[ $minimum != c ]];then
-      [[ -n $candidate_version ]] && version_ge "$candidate_version" "$minimum" || die "Для Go $version нужен bootstrap >= $minimum."
-    fi
-    candidate=$(set -Eeuo pipefail; build_stage "$filename" "$version" "$sha" "$candidate")
-    candidate_version=$(go_version "$candidate")
-  done < <(manifest)
-  if [[ $action == prepare ]];then begin;emit status prepared;emit go_target "$MIN_GO";return;fi
-  [[ -n $candidate_version ]] && version_ge "$candidate_version" "$MIN_GO" || die 'Go не достиг требуемой версии 1.25.12.'
-  begin;emit go_binary "$candidate";emit go_version "$candidate_version";emit go_origin source-built
+  if [[ -n $candidate ]];then begin;emit go_binary "$candidate";emit go_version "$(go_version "$candidate")";emit go_origin existing;return;fi
+  select_archive
+  dir="$WORK/toolchains/prebuilt-go$MIN_GO-$GO_ARCH"
+  candidate=$(cached_binary "$dir") || candidate=''
+  if [[ -n $candidate ]];then begin;emit go_binary "$candidate";emit go_version "$MIN_GO";emit go_origin official-prebuilt;return;fi
+  archive=$(set -Eeuo pipefail;download_archive)
+  if [[ $action == prepare ]];then begin;emit status prepared;emit go_archive "$archive";emit go_target "$MIN_GO";return;fi
+  progress "Распаковка готового Go $MIN_GO; компиляция Go не выполняется."
+  candidate=$(set -Eeuo pipefail;unpack_archive "$archive" "$dir")
+  begin;emit go_binary "$candidate";emit go_version "$MIN_GO";emit go_origin official-prebuilt
 }
 run "$@"
-ZABBIX_AGENT2_EMBEDDED_GOBUILDER_20261125
+ZABBIX_AGENT2_READY_GO_20261125
 }
 run_go_builder() { go_builder_payload | ZABBIX_LOCAL_WORK_ROOT="$WORK" bash -s -- "$@"; }
 configure_go_environment() {
   export GOCACHE="$WORK/go/build-cache" GOMODCACHE="$WORK/go/module-cache" GOPATH="$WORK/go/path" GOTMPDIR="$WORK/tmp"
-  export GOTOOLCHAIN=local GOENV=off CGO_ENABLED=1 GOPROXY=off GOSUMDB=off
+  export GOTOOLCHAIN=local GOENV=off GOTELEMETRY=off CGO_ENABLED=1 GOPROXY=off GOSUMDB=off
   mkdir -p -- "$GOCACHE" "$GOMODCACHE" "$GOPATH"
 }
 ensure_go() {
@@ -1029,9 +938,9 @@ ensure_go() {
   init_work
   configure_go_environment
   result=$(run_go_builder ensure)
-  [[ "$result" == ZA_AUDIT_V1$'\n'* ]] || { fail 'Не получен корректный результат подготовки Go из исходников.'; return 1; }
+  [[ "$result" == ZA_AUDIT_V1$'\n'* ]] || { fail 'Не получен корректный результат подготовки готового Go.'; return 1; }
   go_binary=$(field "$result" go_binary)
-  [[ "$go_binary" == /* && -x "$go_binary" && "$go_binary" != *$'\n'* ]] || { fail 'Не найден собранный или подходящий существующий Go.'; return 1; }
+  [[ "$go_binary" == /* && -x "$go_binary" && "$go_binary" != *$'\n'* ]] || { fail 'Не найден готовый или подходящий существующий Go.'; return 1; }
   export PATH="$(dirname -- "$go_binary"):$PATH"
   printf '%s\n' "$result" >"$WORK/logs/go-toolchain.tsv"
   say "Go для сборки Agent 2: $go_binary"
@@ -1068,9 +977,6 @@ init_work() {
     [[ ! -L "$WORK/$dir" ]] || { fail "Символическая ссылка в рабочем каталоге: $dir"; return 1; }
     mkdir -p -- "$WORK/$dir"; chmod 700 "$WORK/$dir"
   done
-  [[ ! -L "$PREFIX" ]] || { fail "Символическая ссылка вместо локального prefix."; return 1; }
-  mkdir -p -- "$PREFIX"
-  [[ $(stat -c %u -- "$PREFIX") == "$EUID" ]] || { fail "Локальный prefix принадлежит другому пользователю."; return 1; }
 }
 read_tty() {
   local name=$1 prompt=$2
@@ -1091,7 +997,7 @@ display_audit() {
   local key value
   say "Каталог запуска: $LAUNCH_DIR"
   say "Исходники, зависимости, сборки, отчёты и backup: $WORK"
-  say "Целевая версия: $TARGET_VERSION; установка пакетов запрещена."
+  say "Целевая версия: $TARGET_VERSION; APT-пакеты и готовый Go устанавливаются только по командам prepare/build/apply."
   for key in hostname addresses os_name os_version astra_version astra_build architecture glibc kernel cpu_count mem_available_kb disk_work_free_kb initial_user astra variant version classic_binary classic_version agent2_binary agent2_version service service_state binary config config_exists orphan_configs ambiguous tools_missing build_ready pcre2_version openssl_version extra_features candidates; do
     value=$(field "$AUDIT" "$key")
     printf '%-19s %s\n' "$key:" "${value:--}"
@@ -1108,16 +1014,9 @@ guard_agent2() {
   [[ -z "$variant" || "$variant" == agent2 || "$variant" == classic ]] || { fail 'Неизвестный тип установленного агента. Изменения заблокированы.'; return 1; }
 }
 
-safe_extract() {
-  local archive=$1 destination=$2
-  tar -tzf "$archive" | awk '/^\// {bad=1} /(^|\/)\.\.($|\/)/ {bad=1} END{exit bad}' || { fail 'Архив содержит опасный путь.'; return 1; }
-  if tar -tvzf "$archive" | awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {bad=1} END{exit !bad}'; then fail 'В исходном архиве есть ссылки или специальные файлы; они не разрешены.'; return 1; fi
-  mkdir -m 0700 -- "$destination"
-  tar --no-same-owner --no-same-permissions -xzf "$archive" -C "$destination"
-}
 register_archive() {
   local name=$1 archive=$2 expected=$3 actual destination
-  [[ "$name" == zabbix || "$name" == pcre2 || "$name" == openssl ]] || { fail 'Имя исходников: zabbix, pcre2 или openssl.'; return 1; }
+  [[ "$name" == zabbix ]] || { fail 'Из исходников собирается только Zabbix.'; return 1; }
   [[ -f "$archive" && ! -L "$archive" && "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || { fail 'Нужны локальный .tar.gz и доверенная SHA-256 (64 hex символа).'; return 1; }
   actual=$(sha256sum -- "$archive" | awk '{print $1}')
   [[ "$actual" == "${expected,,}" ]] || { fail 'SHA-256 исходников не совпадает.'; return 1; }
@@ -1130,7 +1029,7 @@ register_archive() {
 }
 fetch_archive() {
   local name=$1 url=$2 sha=$3 temp
-  [[ "$name" == zabbix || "$name" == pcre2 || "$name" == openssl ]] || { fail 'fetch NAME URL SHA: NAME — zabbix/pcre2/openssl.'; return 1; }
+  [[ "$name" == zabbix ]] || { fail 'fetch zabbix HTTPS_URL SHA256.'; return 1; }
   [[ "$url" == https://* && "$url" != *$'\n'* && "$url" != *$'\r'* && "$sha" =~ ^[A-Fa-f0-9]{64}$ ]] || { fail 'fetch требует HTTPS URL и заранее проверенную SHA-256.'; return 1; }
   init_work
   temp=$(mktemp "$WORK/sources/download.XXXXXXXX.tar.gz")
@@ -1138,12 +1037,12 @@ fetch_archive() {
     if ! curl --disable --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 900 --retry 1 --output "$temp" -- "$url"; then rm -f -- "$temp"; offline_instructions; fail 'Скачивание не удалось.'; return 1; fi
   elif command -v wget >/dev/null; then
     if ! wget --https-only --timeout=15 --tries=2 --output-document="$temp" -- "$url"; then rm -f -- "$temp"; offline_instructions; fail 'Скачивание не удалось.'; return 1; fi
-  else rm -f -- "$temp"; offline_instructions; fail 'Нет curl/wget. Их установка запрещена.'; return 1; fi
+  else rm -f -- "$temp"; offline_instructions; fail 'Нет curl/wget. Выполните prepare для установки инструментов.'; return 1; fi
   register_archive "$name" "$temp" "$sha"
   rm -f -- "$temp"
 }
 offline_instructions() {
-  printf '%s\n' 'Для работы без сети перенесите через RDP в текущий каталог запуска три официальных архива:' '  zabbix-7.0.32.tar.gz' '  pcre2-10.47.tar.gz' '  openssl-3.5.9.tar.gz' "Каталог: $LAUNCH_DIR" 'Затем повторите prepare или apply. Их SHA-256 будут проверены автоматически; пакеты не требуются.' >&2
+  printf '%s\n' 'Если сеть недоступна, перенесите через RDP официальный zabbix-7.0.32.tar.gz и архив готового Go в текущий каталог запуска.' "Каталог: $LAUNCH_DIR" 'Для первоначальной подготовки нужны штатные APT-репозитории Astra либо уже установленные пакеты.' >&2
 }
 download_metadata() {
   local url=$1 destination=$2
@@ -1154,141 +1053,112 @@ download_metadata() {
   else offline_instructions; fail 'Нет curl/wget.'; return 1; fi
 }
 prepare() {
-  init_work
-  local name version url sha checksum_file actual current current_sha nearby only_missing=${1-no}
-  local manifest="$WORK/sources/official-sources.tsv"
-  cat >"$manifest" <<'SOURCES'
-zabbix	7.0.32	https://cdn.zabbix.com/zabbix/sources/stable/7.0/zabbix-7.0.32.tar.gz	ead5b0723ad965eb0e79f98d5d2b89088e7c898ae194eeba767e5d1fb2d50a96
-pcre2	10.47	https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.gz	c08ae2388ef333e8403e670ad70c0a11f1eed021fd88308d7e02f596fcd9dc16
-openssl	3.5.9	https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz	603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
-SOURCES
-  say 'prepare скачивает только официальные исходники Zabbix, PCRE2 и OpenSSL в каталог запуска. Пакеты и готовые агенты не скачиваются.'
-  while IFS=$'\t' read -r name version url sha; do
-    current=$(option "${name}_archive"); current_sha=$(option "${name}_sha")
-    if [[ -f "$current" && ! -L "$current" && "$current" == "$WORK/sources/"* && "$current_sha" =~ ^[a-f0-9]{64}$ && $(sha256sum -- "$current" | awk '{print $1}') == "$current_sha" ]]; then
-      if [[ "$only_missing" == yes || "$current_sha" == "$sha" ]]; then say "$name: проверенные исходники уже есть."; continue; fi
-    fi
+  prepare_packages
+  local name=zabbix version=7.0.32 url=https://cdn.zabbix.com/zabbix/sources/stable/7.0/zabbix-7.0.32.tar.gz
+  local sha=ead5b0723ad965eb0e79f98d5d2b89088e7c898ae194eeba767e5d1fb2d50a96
+  local checksum_file actual current current_sha nearby only_missing=${1-no}
+  printf '%s\t%s\t%s\t%s\n' "$name" "$version" "$url" "$sha" >"$WORK/sources/official-sources.tsv"
+  current=$(option zabbix_archive); current_sha=$(option zabbix_sha)
+  if [[ -f "$current" && ! -L "$current" && "$current" == "$WORK/sources/"* && "$current_sha" =~ ^[a-f0-9]{64}$ && $(sha256sum -- "$current" | awk '{print $1}') == "$current_sha" && ( "$only_missing" == yes || "$current_sha" == "$sha" ) ]];then
+    say 'Zabbix: проверенные исходники уже есть.'
+  else
     nearby="$LAUNCH_DIR/${url##*/}"
-    if [[ -e "$nearby" ]]; then
-      [[ -f "$nearby" && ! -L "$nearby" && $(sha256sum -- "$nearby" | awk '{print $1}') == "$sha" ]] || { fail "Найденный рядом архив $nearby не совпадает с доверенным SHA-256 или является ссылкой. Замените его официальным архивом."; return 1; }
-      register_archive "$name" "$nearby" "$sha"
-      printf '%s\n' "$sha" >"$WORK/sources/$name-$version.tar.gz.sha256"
-      say "$name: использован локальный архив, сеть не требовалась."
-      continue
-    fi
-    if [[ "$name" != pcre2 ]]; then
-      checksum_file="$WORK/sources/$name-$version.tar.gz.sha256"
+    if [[ -e "$nearby" ]];then
+      [[ -f "$nearby" && ! -L "$nearby" && $(sha256sum -- "$nearby" | awk '{print $1}') == "$sha" ]] || { fail "Архив $nearby не совпадает с доверенной SHA-256 или является ссылкой."; return 1; }
+      register_archive zabbix "$nearby" "$sha"
+      printf '%s\n' "$sha" >"$WORK/sources/zabbix-$version.tar.gz.sha256"
+      say 'Zabbix: использован локальный архив.'
+    else
+      checksum_file="$WORK/sources/zabbix-$version.tar.gz.sha256"
       download_metadata "$url.sha256" "$checksum_file"
       actual=$(grep -oE '[a-fA-F0-9]{64}' "$checksum_file" || true)
-      [[ "$actual" == "$sha" ]] || { fail "Официальная SHA-256 $name отличается от закреплённого значения. Скачивание/сборка остановлены; проверьте release вручную."; return 1; }
-    else
-      printf '%s\n%s\n' "$sha" 'https://github.com/PCRE2Project/pcre2/attestations/12152412' >"$WORK/sources/pcre2-$version.attestation.txt"
+      [[ "$actual" == "$sha" ]] || { fail 'Официальная SHA-256 Zabbix отличается от закреплённой; проверьте выпуск вручную.'; return 1; }
+      fetch_archive zabbix "$url" "$sha"
     fi
-    fetch_archive "$name" "$url" "$sha"
-  done <"$manifest"
+  fi
   local go_result
   go_result=$(run_go_builder prepare)
-  [[ "$go_result" == ZA_AUDIT_V1$'\n'* ]] || { fail 'Не получен результат подготовки исходников Go.'; return 1; }
+  [[ "$go_result" == ZA_AUDIT_V1$'\n'* ]] || { fail 'Не получен результат загрузки готового Go.'; return 1; }
   printf '%s\n' "$go_result" >"$WORK/logs/go-prepare.tsv"
-  say 'Исходники подготовлены. Для плана, сборки и установки выполните apply.'
+  say 'APT-зависимости, исходники Zabbix и готовый Go подготовлены. build — сборка; apply — установка/обновление.'
 }
 archives_ready() {
-  local name archive sha
-  for name in zabbix pcre2 openssl; do
-    archive=$(option "${name}_archive"); sha=$(option "${name}_sha")
-    [[ -f "$archive" && ! -L "$archive" && "$archive" == "$WORK/sources/"* && "$sha" =~ ^[a-f0-9]{64}$ && $(sha256sum -- "$archive" | awk '{print $1}') == "$sha" ]] || return 1
-  done
+  local archive sha
+  archive=$(option zabbix_archive);sha=$(option zabbix_sha)
+  [[ -f "$archive" && ! -L "$archive" && "$archive" == "$WORK/sources/"* && "$sha" =~ ^[a-f0-9]{64}$ && $(sha256sum -- "$archive" | awk '{print $1}') == "$sha" ]]
 }
 checked_archive() {
   local name=$1 archive sha
-  archive=$(option "${name}_archive"); sha=$(option "${name}_sha")
-  [[ -f "$archive" && "$archive" == "$WORK/sources/"* && "$sha" =~ ^[a-f0-9]{64}$ ]] || { fail "Нет исходников $name. Команда: $([[ "$name" == zabbix ]] && printf 'source FILE SHA256' || printf 'dependency %s FILE SHA256' "$name"). Архивы и SHA перенесите вручную либо используйте fetch."; return 1; }
-  [[ $(sha256sum -- "$archive" | awk '{print $1}') == "$sha" ]] || { fail "Изменился SHA-256 зарегистрированного архива $name."; return 1; }
+  [[ "$name" == zabbix ]] || { fail 'Поддерживаются только исходники Zabbix.';return 1; }
+  archive=$(option zabbix_archive);sha=$(option zabbix_sha)
+  [[ -f "$archive" && ! -L "$archive" && "$archive" == "$WORK/sources/"* && "$sha" =~ ^[a-f0-9]{64}$ ]] || { fail 'Нет исходников Zabbix. Выполните prepare либо source FILE SHA256.';return 1; }
+  [[ $(sha256sum -- "$archive" | awk '{print $1}') == "$sha" ]] || { fail 'Изменилась SHA-256 зарегистрированного архива Zabbix.';return 1; }
   printf '%s' "$archive"
 }
 check_toolchain() {
   local tool
-  for tool in cc make tar sha256sum; do command -v "$tool" >/dev/null || { fail "Отсутствует $tool. Пакеты не устанавливаются; нужен уже имеющийся компилятор/инструмент."; return 1; }; done
+  for tool in cc make tar sha256sum ar ranlib ld perl pkg-config ldd getfattr setfattr;do
+    command -v "$tool" >/dev/null || { fail "После подготовки не найден $tool. Проверьте установку пакетов и PATH.";return 1; }
+  done
+  pkg-config --exists openssl libpcre2-8 || { fail 'Не найдены системные development-файлы OpenSSL/PCRE2 после установки libssl-dev/libpcre2-dev.';return 1; }
 }
-dependency_ready() {
-  local name=$1 sha
-  sha=$(option "${name}_sha")
-  [[ -n "$sha" && -f "$PREFIX/.${name}.sha256" && $(cat "$PREFIX/.${name}.sha256") == "$sha" ]] || return 1
-  if [[ "$name" == pcre2 ]]; then [[ -s "$PREFIX/lib/libpcre2-8.a" && -r "$PREFIX/include/pcre2.h" ]]
-  else [[ -s "$PREFIX/lib/libssl.a" && -s "$PREFIX/lib/libcrypto.a" && -r "$PREFIX/include/openssl/ssl.h" ]]; fi
-}
-build_dependency() {
-  local name=$1 archive source stage log item
-  archive=$(checked_archive "$name")
-  if dependency_ready "$name"; then say "$name: локальная сборка уже подготовлена."; return; fi
-  stage=$(mktemp -d "$WORK/builds/$name.XXXXXXXX")
-  log="$stage/build.log"
-  safe_extract "$archive" "$stage/src"
-  local candidates=()
-  if [[ "$name" == pcre2 ]]; then
-    while IFS= read -r item; do candidates+=("$item"); done < <(find "$stage/src" -maxdepth 2 -type f -name configure -print)
-  else
-    while IFS= read -r item; do candidates+=("$item"); done < <(find "$stage/src" -maxdepth 2 -type f -name Configure -print)
-  fi
-  [[ ${#candidates[@]} -eq 1 ]] || { fail "Архив $name должен содержать один release. Каталог: $stage"; return 1; }
-  source=$(dirname "${candidates[0]}")
-  say "Сборка $name только в локальный prefix. Журнал: $log"
-  if [[ "$name" == pcre2 ]]; then
-    if ! (cd "$source" || exit; export TMPDIR="$WORK/tmp" CFLAGS='-O2'; ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --disable-shared --enable-static --enable-unicode --disable-jit --disable-pcre2grep-libz --disable-pcre2grep-libbz2 --disable-pcre2test-libreadline --disable-pcre2test-libedit && make -j 2 && make install) >"$log" 2>&1; then fail "Сборка PCRE2 не удалась. Пакеты не устанавливались. Журнал: $log"; return 1; fi
-  else
-    command -v perl >/dev/null || { fail 'Для сборки OpenSSL нужен уже имеющийся Perl. Автоматическая установка запрещена.'; return 1; }
-    [[ -f "$source/VERSION.dat" ]] && grep -qE '^MAJOR=3$' "$source/VERSION.dat" || { fail 'Используйте официальный source release OpenSSL 3.x с VERSION.dat (MAJOR=3).'; return 1; }
-    if ! (cd "$source" || exit; export TMPDIR="$WORK/tmp" CFLAGS='-O2'; ./config --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib no-shared no-module no-zlib no-autoload-config no-tests && make -j 2 && make install_sw) >"$log" 2>&1; then fail "Сборка OpenSSL не удалась. Пакеты не устанавливались. Журнал: $log"; return 1; fi
-  fi
-  printf '%s\n' "$(option "${name}_sha")" >"$PREFIX/.${name}.sha256"
-  dependency_ready "$name" || { fail "Сборка $name не создала ожидаемые статические библиотеки."; return 1; }
-  say "$name: готово."
-}
-build_deps() {
-  refresh_audit; guard_astra; guard_agent2
-  check_toolchain
-  # Validate both archives before creating or compiling anything.
-  checked_archive pcre2 >/dev/null; checked_archive openssl >/dev/null
+prepare_packages() {
+  [[ "$APT_PREPARED" != yes ]] || return 0
+  [[ $EUID -eq 0 ]] || { fail 'Для подготовки APT-зависимостей запустите скрипт от root в этом же каталоге.';return 1; }
+  refresh_audit;guard_astra;guard_agent2
+  command -v apt-get >/dev/null || { fail 'На этой Astra не найден apt-get.';return 1; }
   init_work
-  build_dependency pcre2
-  build_dependency openssl
+  local packages=(gcc make libc6-dev binutils perl pkg-config curl ca-certificates libssl-dev libpcre2-dev attr)
+  [[ ! -L "$WORK/apt" && ! -L "$WORK/apt/archives" && ! -L "$WORK/apt/archives/partial" ]] || { fail 'Символическая ссылка в локальном APT-кеше.';return 1; }
+  mkdir -p -- "$WORK/apt/archives/partial"
+  chmod 700 "$WORK/apt" "$WORK/apt/archives" "$WORK/apt/archives/partial"
+  say 'Предустановка инструментов и системных библиотек из уже настроенных репозиториев Astra:'
+  printf '  %s\n' "${packages[*]}"
+  say 'libssl-dev/libpcre2-dev нужны для сборки Agent2; attr сохраняет атрибуты прежнего бинарника. Дополнительные программы из исходников не собираются.'
+  if ! apt-get update 2>&1 | tee "$WORK/logs/apt-update.log";then
+    fail "APT update завершился ошибкой. Служба Zabbix не изменялась. Журнал: $WORK/logs/apt-update.log";return 1
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-remove --no-install-recommends -o "Dir::Cache::archives=$WORK/apt/archives" -o APT::Keep-Downloaded-Packages=true -o APT::Sandbox::User=root "${packages[@]}" 2>&1 | tee "$WORK/logs/apt-install.log";then
+    fail "Предустановка пакетов завершилась ошибкой. Сборка/замена агента не выполнялась. Журнал: $WORK/logs/apt-install.log";return 1
+  fi
+  check_toolchain
+  APT_PREPARED=yes
+  refresh_audit
 }
 build_agent() {
   local archive sha dir result artifact digest
-  refresh_audit; guard_astra; guard_agent2
-  check_toolchain
-  init_work
+  refresh_audit;guard_astra;guard_agent2
+  prepare_packages
   if ! archives_ready;then prepare yes;fi
-  archive=$(checked_archive zabbix); sha=$(option zabbix_sha)
+  archive=$(checked_archive zabbix);sha=$(option zabbix_sha)
   ensure_go
-  if ! dependency_ready pcre2 || ! dependency_ready openssl; then build_deps; fi
   result=$(run_worker workspace)
   dir=$(field "$result" workspace)
-  [[ "$dir" == "$WORK/builds/build."* && -d "$dir" && ! -L "$dir" ]] || { fail 'Некорректный каталог сборки worker.'; return 1; }
+  [[ "$dir" == "$WORK/builds/build."* && -d "$dir" && ! -L "$dir" ]] || { fail 'Некорректный каталог сборки worker.';return 1; }
   cp -- "$archive" "$dir/source.tar.gz"
-  say "Сборка Zabbix Agent 2 $TARGET_VERSION. Журнал: $dir/build.log"
-  if ! result=$(run_worker build "$dir" "$sha" "$TARGET_VERSION" 2 agent2 "$PREFIX"); then
+  say "Сборка только Zabbix Agent2 $TARGET_VERSION. Журнал: $dir/build.log"
+  if ! result=$(run_worker build "$dir" "$sha" "$TARGET_VERSION" 2 agent2 '');then
     printf '%s\n' "$result" >"$WORK/logs/build-failed.tsv"
-    fail "Сборка остановлена. $(field "$result" error) Журнал: $dir/build.log"; return 1
+    fail "Сборка остановлена. $(field "$result" error) Журнал: $dir/build.log";return 1
   fi
-  artifact=$(field "$result" artifact); digest=$(field "$result" sha256)
-  [[ "$artifact" == "$dir/artifact/"* && -f "$artifact" && "$digest" =~ ^[a-f0-9]{64}$ ]] || { fail 'Не получен проверенный результат сборки.'; return 1; }
-  [[ $(sha256sum -- "$artifact" | awk '{print $1}') == "$digest" ]] || { fail 'SHA-256 результата сборки не совпадает.'; return 1; }
+  artifact=$(field "$result" artifact);digest=$(field "$result" sha256)
+  [[ "$artifact" == "$dir/artifact/"* && -f "$artifact" && "$digest" =~ ^[a-f0-9]{64}$ ]] || { fail 'Не получен проверенный результат сборки.';return 1; }
+  [[ $(sha256sum -- "$artifact" | awk '{print $1}') == "$digest" ]] || { fail 'SHA-256 результата сборки не совпадает.';return 1; }
   printf '%s\n' "$result" >"$WORK/logs/build.tsv"
   printf '%s\n' "$AUDIT" >"$WORK/logs/build-audit.tsv"
-  put_option artifact "$artifact"; put_option artifact_sha "$digest"; put_option built_source_sha "$sha"
-  put_option built_pcre2_sha "$(option pcre2_sha)"; put_option built_openssl_sha "$(option openssl_sha)"
-  say "Собранный Agent 2: $artifact. Служба ещё не изменена."
+  put_option artifact "$artifact";put_option artifact_sha "$digest";put_option built_source_sha "$sha"
+  put_option built_mode system-libs-v1
+  say "Собранный Agent2: $artifact. Установка/замена агента ещё не выполнялась."
 }
 artifact_ready() {
   local artifact digest previous key actual
-  artifact=$(option artifact); digest=$(option artifact_sha)
-  [[ -f "$artifact" && "$artifact" == "$WORK/builds/"* && "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ $(option built_mode) == system-libs-v1 ]] || return 1
+  artifact=$(option artifact);digest=$(option artifact_sha)
+  [[ -f "$artifact" && ! -L "$artifact" && "$artifact" == "$WORK/builds/"* && "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ $(sha256sum -- "$artifact" | awk '{print $1}') == "$digest" ]] || return 1
   [[ $(option built_source_sha) == "$(option zabbix_sha)" && -f "$WORK/logs/build-audit.tsv" ]] || return 1
-  [[ -n $(option built_pcre2_sha) && $(option built_pcre2_sha) == "$(option pcre2_sha)" && -n $(option built_openssl_sha) && $(option built_openssl_sha) == "$(option openssl_sha)" ]] || return 1
   previous=$(cat -- "$WORK/logs/build-audit.tsv")
-  for key in os_id os_version astra_version architecture glibc; do
+  for key in os_id os_version astra_version architecture glibc library_fingerprint;do
     actual=$(field "$AUDIT" "$key")
     [[ -n "$actual" && "$actual" == "$(field "$previous" "$key")" ]] || return 1
   done
@@ -1312,7 +1182,7 @@ new_config() {
 }
 deploy() {
   local request=$1 binary config service mode orphan answer supplied='' result backup item variant old_binary='' old_config='' old_service='' orphan_classic=''
-  [[ $EUID -eq 0 ]] || { fail 'Для установки/обновления запустите скрипт от root в этом же каталоге. Скрипт сам не меняет sudo и не устанавливает пакеты.'; return 1; }
+  [[ $EUID -eq 0 ]] || { fail 'Для установки/обновления запустите скрипт от root в этом же каталоге.'; return 1; }
   refresh_audit; guard_astra; guard_agent2
   if [[ $(field "$AUDIT" ambiguous) == yes ]]; then
     for item in binary config service; do [[ -n $(option "$item") ]] || { fail 'Обнаружены неоднозначные агенты/службы. Задайте set binary/config/service перед изменениями.'; return 1; }; done
@@ -1358,11 +1228,11 @@ deploy() {
   fi
   [[ -n "$binary" && -n "$config" && -n "$service" ]] || { fail 'Не определены binary/config/service. Задайте их командами set.'; return 1; }
   printf '\nПлан: %s Zabbix Agent 2 %s на %s\nБинарник: %s\nКонфиг: %s\nСлужба: %s\n' "$mode" "$TARGET_VERSION" "$(hostname)" "$binary" "$config" "$service"
-  say "Зависимости будут собраны локально в $WORK/deps; системные пакеты не устанавливаются."
+  say "Перед сборкой будут установлены APT-зависимости; готовый Go и исходники останутся в $WORK."
   if [[ -f "$config" ]]; then say 'Существующий конфиг будет сохранён и использован без перезаписи.'; fi
   confirm "$(hostname)"
-  # After explicit approval perform the entire local source workflow.
-  init_work
+  # The user command and hostname confirmation authorize APT prerequisites and deployment.
+  prepare_packages
   if ! artifact_ready; then
     if ! archives_ready; then prepare yes; fi
     build_agent
@@ -1420,215 +1290,170 @@ rollback() {
 }
 help_text() {
   cat <<'HELP'
-Локальный скрипт: запускается на самом COD, SSH/Ansible не использует.
-Без аргументов: только анализ, затем меню (если есть терминал).
-  analyze / --analyze / audit / plan   только анализ, без изменений и mkdir
-  report                              сохранить анализ в локальную папку
-  prepare                             взять исходники рядом или скачать официальные
-  source FILE.tar.gz SHA256            зарегистрировать исходники Zabbix 7.0.32
-  dependency pcre2 FILE.tar.gz SHA256   зарегистрировать исходники PCRE2
-  dependency openssl FILE.tar.gz SHA256 зарегистрировать исходники OpenSSL 3.x
-  fetch zabbix|pcre2|openssl HTTPS_URL SHA256
-                                      явное скачивание только исходного архива
-  build-deps                          собрать статические библиотеки локально
-  build                               собрать Zabbix Agent 2 из исходников
-  install / update / apply             план, подтверждение, сборка и установка
-                                      apply сам выбирает install/update
+Локальный Agent2: запуск на самом COD через RDP, без SSH/Ansible.
+Без аргументов: только анализ, затем меню. Анализ не ставит пакеты и не меняет службу.
+  analyze / --analyze / audit / plan   только анализ
+  report                              сохранить анализ
+  prepare                             APT-зависимости, исходники Zabbix и готовый Go
+  build                               подготовить окружение и собрать только Agent2
+  install / update / apply             план, подтверждение, подготовка и установка
+                                      apply сам выбирает install/update/миграцию
+  source FILE.tar.gz SHA256            зарегистрировать исходный архив Zabbix
+  fetch zabbix HTTPS_URL SHA256        скачать исходный архив Zabbix с проверкой
   set binary /absolute/path           явный путь существующего бинарника
   set config /absolute/path           явный старый конфиг
   set service NAME.service            явная существующая служба
   status                              состояние и версия
-  rollback                            откат из последней резервной копии
+  rollback                            откат последней операции с агентом
   help / guide                        инструкция
   quit                                выход
 
-Все материалы сохраняются в .zabbix-agent2-work ТЕКУЩЕГО КАТАЛОГА ЗАПУСКА.
-Запускайте скрипт каждый раз из одной папки. Для установки нужен root.
-Системные пакеты НЕ устанавливаются. cc/make/Perl и libc headers должны уже
-существовать. Подходящий Go используется существующий; иначе компилируется
-из исходников через исходную bootstrap-цепочку, без готовых Go-бинарников.
-PCRE2/OpenSSL собираются из исходников в local prefix;
-локальный make install зависимостей не изменяет системные /usr/lib и /usr/include.
-Исходные .tar.gz перенесите через RDP/носитель. SHA-256 возьмите из доверенного
-источника, а не из непроверенного скачанного файла. Скачивание по prepare/fetch.
-apply после подтверждения автоматически подготавливает исходники и собирает всё.
-Для offline положите рядом zabbix-7.0.32.tar.gz, pcre2-10.47.tar.gz и
-openssl-3.5.9.tar.gz; если подходящего Go нет, нужны также исходные архивы
-Go bootstrap-цепочки. prepare/apply проверят закреплённые SHA-256 без сети.
-Go-модули входят исходниками в vendor официального архива Zabbix: сборка
-использует -mod=vendor, без загрузки Go-модулей или готовых toolchain-бинарников.
-Старый конфиг сохраняется; если его нет, параметры запрашиваются при установке.
-Собирается только Agent 2. Классический агент мигрируется с резервной копией.
-Классический LoadModule (.so) требует эквивалентного Agent 2 plugin и блокирует
-автоматическую миграцию. Старые конфиги и Include копируются с адаптацией.
-Windows и другие ОС не изменяются. Политики/защита Astra не отключаются.
+prepare/build/apply выполняются от root. Устанавливаются gcc make libc6-dev
+binutils perl pkg-config curl ca-certificates, а также libssl-dev/libpcre2-dev
+и attr для сохранения атрибутов прежнего бинарника.
+APT использует уже настроенные репозитории Astra: sources.list не изменяется,
+обновление всей ОС и удаление пакетов не выполняются. Журналы APT сохраняются,
+скачанные .deb направлены в .zabbix-agent2-work/apt/archives.
+Go скачивается готовым официальным архивом и проверяется по SHA-256; при наличии
+подходящего Go используется он. Go, OpenSSL и PCRE2 из исходников не собираются.
+Из исходников собирается только Zabbix Agent2 7.0.32, Go-модули берутся из vendor.
+Материалы находятся в .zabbix-agent2-work текущего каталога запуска. Старая
+цепочка компиляторов в этой папке не используется и автоматически не удаляется.
+После build работающая служба не заменяется; установка выполняется по apply.
+Старый конфиг Agent2 сохраняется. Классический агент мигрируется с backup/откатом;
+LoadModule требует отдельной подготовки. Политики и защиты Astra не отключаются.
+Откат восстанавливает агент и службу; установленные APT-зависимости остаются.
 HELP
 }
 guide_text() {
-  cat <<'ZABBIX_AGENT2_EMBEDDED_GUIDE_20261125'
-# Zabbix Agent 2 на самом COD: только исходники
+  cat <<'ZABBIX_AGENT2_READY_GUIDE_20261125'
+# Zabbix Agent2 на COD: готовый Go и сборка только Zabbix
 
-`zabbix_agent2_local.sh` запускается непосредственно на COD с Astra Linux из
-терминала в RDP. SSH и Ansible не нужны. Целевой выпуск — Agent 2 версии 7.0.32.
-Пакеты и готовые бинарники агента, библиотек или Go не устанавливаются.
+Скрипт запускается прямо на COD с Astra Linux из терминала в RDP. SSH/Ansible
+не нужны. Он собирает Zabbix Agent2 7.0.32 из исходников, использует готовый Go
+и системные библиотеки OpenSSL/PCRE2. Цепочки сборки Go и сборки библиотек нет.
 
-## Анализ
+## Запуск
 
-Перенесите полный скрипт на COD и перейдите в папку для всех материалов:
+Остановите прежний запущенный скрипт через Ctrl+C, замените файл целиком и
+перезапустите из той же рабочей папки под root:
 
 ```bash
 cd /home/rcodaib/tmp
 bash ./zabbix_agent2_local.sh
 ```
 
-Сначала выполняется только анализ, затем появляется меню. Анализ не скачивает
-исходники, не создаёт рабочую папку, не изменяет конфиг и не перезапускает службу.
-Для одного анализа без меню:
+Первый запуск выполняет только анализ и открывает меню. Анализ не устанавливает
+пакеты, не скачивает Go, не создаёт рабочую папку и не перезапускает службу.
+Отдельный анализ без меню: `bash zabbix_agent2_local.sh --analyze`.
 
-```bash
-bash ./zabbix_agent2_local.sh --analyze
-```
-
-Для установки/обновления нужны права root. Для всего процесса используйте одну
-учётную запись, чтобы рабочие папки и сборки принадлежали одному пользователю.
-
-## Только собрать Agent 2
-
-В меню:
+## Основные команды
 
 ```text
+prepare
 build
+apply
+status
+rollback
+quit
 ```
 
-Будут подготовлены проверенные исходники, Go при необходимости, PCRE2/OpenSSL
-и сам `zabbix_agent2`. Путь к готовому файлу и журналу сборки выводится на экран.
-Работающая служба при `build` не меняется. `prepare` позволяет заранее скачать
-только исходники, без компиляции. `report` сохраняет анализ в рабочей папке.
+- `prepare`: установить необходимые пакеты, подготовить готовый Go и исходники
+  Zabbix. Компиляция агента и изменение службы не выполняются.
+- `build`: выполнить недостающую подготовку и собрать только `zabbix_agent2`.
+  Работающая служба не изменяется. Путь к бинарнику и журналу выводится на экран.
+- `apply`: показать план, запросить точное имя компьютера для подтверждения,
+  подготовить/собрать агент и выполнить установку либо обновление.
+- `status`: показать состояние и версию.
+- `rollback`: восстановить последнюю версию агента/состояние службы.
 
-## Установить или обновить
+`install` дополнительно требует отсутствия агента; `update` требует его наличия.
+APT и сборка выполняются только после явной команды подготовки/сборки/установки.
+
+## Какие пакеты устанавливаются
+
+Используется `apt-get install --no-install-recommends` с набором:
 
 ```text
-apply
+gcc make libc6-dev binutils perl pkg-config curl ca-certificates
+libssl-dev libpcre2-dev attr
 ```
 
-Скрипт выполняет свежий анализ и показывает план. Для подтверждения потребуется
-ввести точное имя компьютера. Затем он выполняет недостающие шаги сборки и
-установку/обновление. `install` требует отсутствия агента; `update` требует
-существующего агента. Существующий Agent 2 обновляется с прежним конфигом и службой.
+Первые восемь пакетов — запрошенное сборочное окружение. `libssl-dev` и
+`libpcre2-dev` нужны для сборки Agent2 с системными библиотеками, без компиляции
+OpenSSL и PCRE2. Пакет `attr` сохраняет и проверяет расширенные атрибуты бинарника
+без компиляции вспомогательных программ. Используются настроенные репозитории этой версии Astra;
+скрипт не меняет sources.list и не выполняет общий upgrade системы. APT может
+подготовить необходимые зависимости запрошенных пакетов штатным способом.
+Если установка пакетов завершилась ошибкой, замена агента не начинается.
 
-Если сейчас установлен классический `zabbix_agentd`, план будет явно обозначен
-как миграция. Создаются отдельные бинарник, конфиг и служба Agent 2. Совместимые
-Server/ServerActive/Hostname/TLS/UserParameter/AllowKey/DenyKey сохраняются.
-Include разворачиваются в новый конфиг как снимок текущих настроек; старые конфиги
-и бинарник не перезаписываются. Классические StartAgents/User/AllowRoot заменяются
-соответствующими настройками Agent 2/systemd. Runtime PID/socket получают отдельную
-папку `/run/zabbix-agent2-source`. Старый агент останавливается и отключается
-только после проверки нового бинарника с новым конфигом.
+Пакет Zabbix Agent2 из репозитория не устанавливается: сам агент собирается
+из проверенного архива исходников Zabbix 7.0.32.
 
-Активные LoadModule, нестандартный пользователь, AllowRoot=1 и неизвестные
-параметры требуют отдельной подготовки: скрипт остановится до отключения старого
-агента. Он не удаляет такие настройки догадками. Если конфига нет, будут запрошены
-Server, ServerActive и Hostname. Для active-only Server не записывается;
-несовместимый с Agent 2 StartAgents не добавляется.
+## Готовый Go
 
-## Все материалы находятся в каталоге запуска
+Если подходящий Go >= 1.25.12 уже доступен, он используется. Иначе скрипт
+скачивает официальный готовый Go 1.25.12 для архитектуры машины, проверяет
+закреплённую SHA-256 и распаковывает в локальный `toolchains`. Поддержаны Linux
+amd64, arm64 и 386. Системный `/usr/local/go` не заменяется.
 
-Рабочая папка — `.zabbix-agent2-work` внутри ТЕКУЩЕГО КАТАЛОГА ЗАПУСКА (`pwd -P`).
-Это отдельная папка от предыдущей версии скрипта для классического агента.
+Go не компилируется. Автоматическое скачивание другого toolchain выключено
+через `GOTOOLCHAIN=local`. Go-модули берутся из `vendor` официального архива
+Zabbix; GOPROXY/GOSUMDB выключены. Кеши и временные файлы находятся в рабочей папке.
+Повторный запуск использует проверенный готовый Go из кеша.
+
+## Где лежат файлы
+
+Рабочая папка — `.zabbix-agent2-work` внутри текущего каталога запуска (`pwd -P`).
+Каждый раз запускайте скрипт из одной папки и от одной учётной записи root.
+Для сборки используйте путь без пробелов и кириллицы.
 
 | Подпапка | Содержимое |
 | --- | --- |
-| sources | Проверенные архивы исходников и manifest |
-| deps/prefix | Локальные статические PCRE2/OpenSSL |
-| toolchains | Компиляторы Go, собранные из исходников |
-| go, caches, deps/gopath, deps/gomod | Локальные кеши и рабочие каталоги Go |
-| builds | Распакованные исходники, журналы и готовый Agent 2 |
+| sources | Проверенный исходный архив Zabbix |
+| downloads | Архив готового Go |
+| apt/archives | Загруженные APT-пакеты |
+| toolchains | Распакованный готовый Go |
+| go, caches | Локальные кеши Go |
+| builds | Исходники, журналы и собранный Agent2 |
 | tmp | Временные файлы |
 | logs, reports | Журналы операций и сохранённый анализ |
 | backups | Резервные копии и сведения для отката |
 
-Всегда запускайте скрипт из одной папки. Для сборки нужен путь без пробелов и
-кириллицы. Установленный агент, его служба, рабочие журналы и конфиг размещаются
-по штатным системным путям. Сборочные зависимости остаются внутри рабочей папки.
+Системные пакеты APT устанавливаются в штатные пути ОС. Установленные агент,
+конфиг и служба также находятся по штатным системным путям. Старые результаты
+сборки Go/библиотек из предыдущей версии не удаляются и этой версией не собираются.
 
-## Go и исходные зависимости
+## Конфигурация, миграция и откат
 
-В исходниках Agent 2 7.0.32 требуется Go не ниже 1.25.12. Подходящий существующий
-Go используется без переустановки. Команда с именем `go` проверяется по формату
-и версии: наличие одноимённой программы не считается установленным компилятором.
+У существующего Agent2 сохраняются прежние конфиг, Include, Hostname, TLS,
+UserParameter и параметры службы. Перед заменой проверяются SHA-256, версия,
+тип агента, конфиг через `-T` и локальный `agent.ping`. Делается резервная копия,
+бинарник заменяется атомарно, после запуска проверяется фактический процесс.
+При ошибке выполняется откат. Повтор с тем же работающим бинарником не
+перезапускает службу.
 
-Если подходящего Go нет, он собирается из проверенных официальных исходников.
-Для машины совсем без Go предусмотрена цепочка C bootstrap Go 1.4 → Go 1.17.13 →
-Go 1.20.14 → Go 1.22.12 → Go 1.25.12. При наличии промежуточного Go начальные стадии
-пропускаются. Все исходники, готовые локальные компиляторы, кеши и временные файлы
-остаются в рабочей папке. Готовый бинарный дистрибутив Go не скачивается;
-`GOTOOLCHAIN=local` запрещает автоматическое скачивание бинарного toolchain.
-Первичная сборка всей цепочки занимает больше времени и места, чем повторный запуск.
-Успешные стадии с проверенным происхождением используются повторно.
+Если сейчас работает классический `zabbix_agentd`, план будет явно обозначен
+как миграция. Создаются отдельные бинарник, конфиг и служба Agent2. Совместимые
+настройки переносятся, Include разворачиваются в новый конфиг как снимок,
+старые файлы не перезаписываются. Runtime PID/socket получают отдельную папку
+`/run/zabbix-agent2-source`. Старый агент останавливается только после проверки
+новой сборки и нового конфига. Ошибка запуска Agent2 восстанавливает старую службу.
 
-C bootstrap без исходного Go предусмотрен для поддерживаемых Go 1.4 архитектур,
-включая x86_64/i386. На другой архитектуре может потребоваться уже имеющийся
-совместимый bootstrap-компилятор Go. Уже имеющиеся C-компилятор, make/binutils,
-libc headers и Perl необходимы: системные пакеты для их установки не используются.
+LoadModule, нестандартный пользователь, AllowRoot=1, неизвестные параметры
+и неоднозначные службы требуют отдельной подготовки; скрипт сообщает причину.
+Если конфига нет, запрашиваются Server, ServerActive и Hostname. Для active-only
+параметр Server не записывается, StartAgents в конфиг Agent2 не добавляется.
 
-PCRE2 10.47 и OpenSSL 3.5.9 собираются статически в локальный prefix. Системные
-PCRE2/OpenSSL не заменяются. `make install`/`install_sw` этих библиотек направлены
-только в private prefix; глобальный `make install` для Zabbix не выполняется.
-Исходники Go-модулей уже включены в официальный архив Zabbix (`vendor`).
-Сборка использует `-mod=vendor` с выключенными GOPROXY/GOSUMDB. Системные libc и
-загрузчик могут оставаться динамическими зависимостями готового агента.
+Для уточнения путей доступны `set binary /absolute/path`, `set config /absolute/path`
+и `set service NAME.service`. `report` сохраняет читаемый анализ.
 
-Архивы скачиваются имеющимися curl либо wget по HTTPS и проверяются SHA-256.
-При отсутствии загрузчика или сети они могут быть перенесены в каталог запуска
-через RDP. Закреплённые имена Zabbix/библиотек:
+Откат относится к агенту и службе. Предварительно установленные пакеты сборки
+автоматически не удаляются. Защиты/подписи/политики Astra не отключаются.
+После обновления проверьте `agent.version` и поступление данных на сервере Zabbix.
 
-```text
-zabbix-7.0.32.tar.gz
-pcre2-10.47.tar.gz
-openssl-3.5.9.tar.gz
-```
-
-Для отсутствующего Go также нужны указанные исходные архивы Go (`.src.tar.gz`)
-и C bootstrap `go1.4-bootstrap-20171003.tar.gz`; список выводится при подготовке.
-Вручную одобренные архивы Zabbix/библиотек можно зарегистрировать командами
-`source FILE SHA256`, `dependency pcre2 FILE SHA256`,
-`dependency openssl FILE SHA256`. SHA256 — доверенные 64 hex символа.
-
-## Проверки, откат и неоднозначные службы
-
-Перед заменой проверяются SHA-256, версия, тип Agent 2, конфиг через `-T` и
-локальный `agent.ping`. Существующий конфиг Agent 2 не перезаписывается.
-Создаётся закрытая резервная копия; замена бинарника атомарная. После запуска
-проверяется фактический процесс и версия. При ошибке выполняется откат.
-Повторная операция с тем же работающим бинарником не перезапускает службу.
-
-```text
-status
-rollback
-```
-
-Откат миграции удаляет только созданные ею новые файлы и восстанавливает работу
-классического агента. Служебный пользователь zabbix и общие каталоги могут остаться.
-Для неразрешимых путей/нескольких служб можно указать проверенные значения:
-
-```text
-set binary /usr/sbin/zabbix_agent2
-set config /etc/zabbix/zabbix_agent2.conf
-set service zabbix-agent2.service
-```
-
-Политики/подписи/защиты Astra не отключаются. После успешной операции проверьте
-`agent.version` и поступление данных на сервере Zabbix. Проверка локального запуска
-не доказывает сетевое соединение с сервером.
-
-Полная справка: `bash zabbix_agent2_local.sh guide`.
-
-Первичные источники:
-https://www.zabbix.com/documentation/7.0/en/manual/installation/install
-https://go.dev/doc/install/source
-https://go.dev/dl/?mode=json&include=all
-https://www.zabbix.com/documentation/7.0/en/manual/appendix/config/zabbix_agent2
-ZABBIX_AGENT2_EMBEDDED_GUIDE_20261125
+Полная инструкция: `bash zabbix_agent2_local.sh guide`.
+ZABBIX_AGENT2_READY_GUIDE_20261125
 }
 dispatch() {
   local command=${1-help}; [[ $# -eq 0 ]] || shift
@@ -1637,10 +1462,9 @@ dispatch() {
     help|--help|-h) help_text ;;
     guide) guide_text ;;
     source) [[ $# -eq 2 ]] || { fail 'source FILE SHA256'; return 1; }; register_archive zabbix "$@" ;;
-    dependency) [[ $# -eq 3 ]] || { fail 'dependency pcre2|openssl FILE SHA256'; return 1; }; [[ "$1" == pcre2 || "$1" == openssl ]] || return 1; register_archive "$@" ;;
-    fetch) [[ $# -eq 3 ]] || { fail 'fetch zabbix|pcre2|openssl HTTPS_URL SHA256'; return 1; }; fetch_archive "$@" ;;
+    dependency|build-deps) fail 'Библиотеки теперь устанавливаются через APT. Используйте prepare или build.' ;;
+    fetch) [[ $# -eq 3 ]] || { fail 'fetch zabbix HTTPS_URL SHA256'; return 1; }; fetch_archive "$@" ;;
     prepare) [[ $# -eq 0 ]] || return 1; prepare ;;
-    build-deps) [[ $# -eq 0 ]] || return 1; build_deps ;;
     build) [[ $# -eq 0 ]] || return 1; build_agent ;;
     install|update|apply) [[ $# -eq 0 ]] || return 1; deploy "$command" ;;
     status) [[ $# -eq 0 ]] || return 1; status ;;
