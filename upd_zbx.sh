@@ -1096,11 +1096,34 @@ checked_archive() {
   printf '%s' "$archive"
 }
 check_toolchain() {
-  local tool
+  local tool module probe_dir probe_log
   for tool in cc make tar sha256sum ar ranlib ld perl pkg-config ldd getfattr setfattr;do
     command -v "$tool" >/dev/null || { fail "После подготовки не найден $tool. Проверьте установку пакетов и PATH.";return 1; }
   done
-  pkg-config --exists openssl libpcre2-8 || { fail 'Не найдены системные development-файлы OpenSSL/PCRE2 после установки libssl-dev/libpcre2-dev.';return 1; }
+  for module in openssl libpcre2-8 zlib;do
+    pkg-config --exists "$module" || { fail "Не найден модуль $module для сборки. Проверьте libssl-dev, libpcre2-dev и zlib1g-dev.";return 1; }
+  done
+  probe_dir=$(mktemp -d "$WORK/tmp/link-check.XXXXXXXX") || return 1
+  probe_log="$WORK/logs/link-prerequisites.log"
+  cat >"$probe_dir/check.c" <<'LINK_PREREQUISITES_C'
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <openssl/ssl.h>
+#include <pcre2.h>
+#include <zlib.h>
+int main(void) {
+    unsigned char version[128];
+    SSL_CTX *ctx = SSL_CTX_new(SSLv23_method());
+    int rc = pcre2_config(PCRE2_CONFIG_VERSION, version);
+    const char *zv = zlibVersion();
+    SSL_CTX_free(ctx);
+    return rc < 0 || zv == 0;
+}
+LINK_PREREQUISITES_C
+  if ! TMPDIR="$probe_dir" cc "$probe_dir/check.c" -o "$probe_dir/check" -lssl -lcrypto -lpcre2-8 -lz >"$probe_log" 2>&1;then
+    rm -rf -- "$probe_dir"
+    fail "Проверка компилятора/линковщика не пройдена: нужны libc6-dev, libssl-dev, libpcre2-dev и zlib1g-dev. Журнал: $probe_log";return 1
+  fi
+  rm -rf -- "$probe_dir"
 }
 prepare_packages() {
   [[ "$APT_PREPARED" != yes ]] || return 0
@@ -1108,13 +1131,13 @@ prepare_packages() {
   refresh_audit;guard_astra;guard_agent2
   command -v apt-get >/dev/null || { fail 'На этой Astra не найден apt-get.';return 1; }
   init_work
-  local packages=(gcc make libc6-dev binutils perl pkg-config curl ca-certificates libssl-dev libpcre2-dev attr)
+  local packages=(gcc make libc6-dev binutils perl pkg-config curl ca-certificates libssl-dev libpcre2-dev zlib1g-dev attr)
   [[ ! -L "$WORK/apt" && ! -L "$WORK/apt/archives" && ! -L "$WORK/apt/archives/partial" ]] || { fail 'Символическая ссылка в локальном APT-кеше.';return 1; }
   mkdir -p -- "$WORK/apt/archives/partial"
   chmod 700 "$WORK/apt" "$WORK/apt/archives" "$WORK/apt/archives/partial"
   say 'Предустановка инструментов и системных библиотек из уже настроенных репозиториев Astra:'
   printf '  %s\n' "${packages[*]}"
-  say 'libssl-dev/libpcre2-dev нужны для сборки Agent2; attr сохраняет атрибуты прежнего бинарника. Дополнительные программы из исходников не собираются.'
+  say 'libssl-dev/libpcre2-dev/zlib1g-dev нужны для линковки Agent2; attr сохраняет атрибуты прежнего бинарника. Дополнительные программы не устанавливаются из исходников.'
   if ! apt-get update 2>&1 | tee "$WORK/logs/apt-update.log";then
     fail "APT update завершился ошибкой. Служба Zabbix не изменялась. Журнал: $WORK/logs/apt-update.log";return 1
   fi
@@ -1309,7 +1332,7 @@ help_text() {
   quit                                выход
 
 prepare/build/apply выполняются от root. Устанавливаются gcc make libc6-dev
-binutils perl pkg-config curl ca-certificates, а также libssl-dev/libpcre2-dev
+binutils perl pkg-config curl ca-certificates, а также libssl-dev/libpcre2-dev/zlib1g-dev
 и attr для сохранения атрибутов прежнего бинарника.
 APT использует уже настроенные репозитории Astra: sources.list не изменяется,
 обновление всей ОС и удаление пакетов не выполняются. Журналы APT сохраняются,
@@ -1376,12 +1399,14 @@ APT и сборка выполняются только после явной к
 
 ```text
 gcc make libc6-dev binutils perl pkg-config curl ca-certificates
-libssl-dev libpcre2-dev attr
+libssl-dev libpcre2-dev zlib1g-dev attr
 ```
 
 Первые восемь пакетов — запрошенное сборочное окружение. `libssl-dev` и
 `libpcre2-dev` нужны для сборки Agent2 с системными библиотеками, без компиляции
-OpenSSL и PCRE2. Пакет `attr` сохраняет и проверяет расширенные атрибуты бинарника
+OpenSSL и PCRE2. `zlib1g-dev` предоставляет zlib для линковки (`-lz`). До основной
+сборки выполняется проверка компиляции и линковки OpenSSL, PCRE2 и zlib.
+Пакет `attr` сохраняет и проверяет расширенные атрибуты бинарника
 без компиляции вспомогательных программ. Используются настроенные репозитории этой версии Astra;
 скрипт не меняет sources.list и не выполняет общий upgrade системы. APT может
 подготовить необходимые зависимости запрошенных пакетов штатным способом.
