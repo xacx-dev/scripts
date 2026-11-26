@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Installer revision: 2026.11.26-configfix2 (configuration preservation and recovery).
 # Local Zabbix Agent 2 source build with APT prerequisites and a ready Go compiler.
 set +x
 set -Eeuo pipefail
@@ -7,6 +8,7 @@ export LC_ALL=C
 LAUNCH_DIR=$(pwd -P)
 WORK="$LAUNCH_DIR/.zabbix-agent2-work"
 TARGET_VERSION=7.0.32
+SCRIPT_REVISION=2026.11.26-configfix2
 AUDIT=''
 APT_PREPARED=no
 
@@ -27,7 +29,7 @@ export GOCACHE="$LOCAL_WORK_ROOT/go/cache" GOMODCACHE="$LOCAL_WORK_ROOT/go/mod" 
 
 emit() { printf '%s\t' "$1"; printf '%s' "${2-}" | base64 | tr -d '\n'; printf '\n'; }
 begin() { printf 'ZA_AUDIT_V1\n'; }
-die() { emit error "$*"; printf '%s\n' "$*" >&2; exit 1; }
+die() { TX_ERROR=$*; emit error "$*"; printf '%s\n' "$*" >&2; exit 1; }
 safe_path() { [[ "$1" =~ ^/[A-Za-z0-9_./+:-]+$ && "$1" != / && "$1" != *'/../'* && "$1" != */.. ]]; }
 safe_service() { [[ "$1" =~ ^[A-Za-z0-9_@.-]+\.service$ && "$1" != .* ]]; }
 safe_version() { [[ "$1" =~ ^7\.0\.[0-9]+$ ]]; }
@@ -359,6 +361,64 @@ snapshot_configs() {
     if [[ -d /etc/zabbix && ! -L /etc/zabbix ]];then cp -a -- /etc/zabbix "$backup/etc-zabbix";fi
     if [[ -f "$config" ]];then cp -a -- "$config" "$backup/config.previous";fi
 }
+preserve_prepared_config() {
+    local backup=$1 source=$2
+    [[ -f "$source" && ! -L "$source" ]] || die 'Prepared configuration is missing or is a symlink.'
+    # Keep the exact prepared bytes even if installing or validating them fails.
+    cp --preserve=all -- "$source" "$backup/config.prepared" || die 'Cannot save the prepared configuration in the transaction backup.'
+    chmod 0600 "$backup/config.prepared"
+}
+ensure_config_directory() {
+    local directory=$1 parent
+    [[ ! -L "$directory" ]] || die "Refusing a symlinked configuration directory: $directory"
+    if [[ "$directory" != / ]];then
+        parent=$(dirname -- "$directory")
+        ensure_config_directory "$parent"
+    fi
+    if [[ -e "$directory" ]];then
+        [[ -d "$directory" ]] || die "A configuration directory path is not a directory: $directory"
+    else
+        install -d -m 0750 -o root -g zabbix -- "$directory" || die "Cannot create configuration directory: $directory"
+    fi
+}
+ensure_config_directories() {
+    local config=$1 directory
+    directory=$(dirname -- "$config")
+    ensure_config_directory "$directory/zabbix_agent2.d/plugins.d"
+}
+prepare_new_config_directory() {
+    local config=$1 backup=$2 directory entries ownership
+    directory=$(dirname -- "$config")
+    ensure_config_directory "$directory"
+    # Earlier versions created this one standard directory with umask 077.
+    # Recover only that exact empty-directory case; preserve all other metadata.
+    if [[ "$directory" == /etc/zabbix && ! -e "$config" && ! -L "$config" ]];then
+        ownership=$(stat -c '%u:%g:%a' -- "$directory") || die 'Cannot inspect the configuration directory metadata.'
+        if [[ "$ownership" == 0:0:700 ]];then
+            entries=$(find "$directory" -mindepth 1 -maxdepth 1 -print -quit) || die 'Cannot inspect whether the configuration directory is empty.'
+            if [[ -z "$entries" ]];then
+                metadata_set "$backup/config_directory" "$directory"
+                metadata_set "$backup/config_directory_metadata_before" "$ownership"
+                chown root:zabbix -- "$directory" && chmod 0750 -- "$directory" || die 'Cannot repair the empty configuration directory left by the earlier installer.'
+                metadata_set "$backup/config_directory_repaired" yes
+            fi
+        fi
+    fi
+}
+capture_deployment_diagnostics() {
+    local service=${TX_SERVICE-} log=${TX_DIAGNOSTICS_LOG-}
+    [[ -n "$log" ]] || return 0
+    {
+        printf 'Deployment diagnostics for %s\n' "$service"
+        printf '\n--- systemctl status ---\n'
+        if safe_service "$service";then systemctl status --no-pager --full "$service";fi
+        printf '\n--- journalctl (last 40 entries) ---\n'
+        if safe_service "$service" && command -v journalctl >/dev/null 2>&1;then
+            journalctl --no-pager -u "$service" -n 40
+        fi
+    } >>"$log" 2>&1
+    chmod 0600 "$log"
+}
 copy_existing_metadata() {
     local original=$1 staged=$2 attrs='' copied='' expected='' actual=''
     command -v getfattr >/dev/null && command -v setfattr >/dev/null || die 'The attr package is required to preserve binary metadata. Run prepare.'
@@ -382,13 +442,20 @@ deployment_exit() {
     set +e
     if [[ -n "${TX_STAGED-}" ]];then rm -f -- "$TX_STAGED";fi
     if [[ $rc -ne 0 && -n "${TX_BACKUP-}" ]];then
+        # Preserve the failed state before rollback removes a new unit/binary.
+        capture_deployment_diagnostics
         if [[ "${TX_MODE-}" == install || "${TX_MODE-}" == migrate || "${TX_BINARY_REPLACED-}" == yes ]];then
             printf 'Deployment failed; attempting rollback from %s\n' "$TX_BACKUP" >&2
-            (set -e;do_rollback "$TX_BACKUP") >&2
+            (set -e;do_rollback "$TX_BACKUP") >>"$TX_DIAGNOSTICS_LOG" 2>&1
             rollback_rc=$?
             if [[ $rollback_rc -ne 0 ]];then printf 'Automatic rollback failed; keep backup %s\n' "$TX_BACKUP" >&2;fi
         fi
         begin;emit status failed;emit backup "$TX_BACKUP"
+        if [[ -z "${TX_ERROR-}" ]];then emit error "Deployment failed with exit code $rc. Inspect the private validation and service diagnostics logs.";fi
+        emit config "${TX_CONFIG-}"
+        emit validation_log "${TX_VALIDATION_LOG-}"
+        emit diagnostics_log "${TX_DIAGNOSTICS_LOG-}"
+        if [[ -f "$TX_BACKUP/config.prepared" ]];then emit prepared_config "$TX_BACKUP/config.prepared";fi
     fi
     exit "$rc"
 }
@@ -410,13 +477,14 @@ do_rollback() {
         mv -fT -- "$stage" "$binary"
         was_active=$(metadata_get "$backup/was_active");version=$(metadata_get "$backup/version_before")
         if [[ "$was_active" == yes ]];then
-            systemctl restart "$service"
+            systemctl restart "$service" || die 'Original binary restored, but restarting its service failed.'
             verify_running "$service" "$binary" "$version" || die 'Original binary restored, but its service did not verify.'
         else
             systemctl stop "$service" || true
         fi
     elif [[ "$mode" == install ]];then
-        # Delete only paths marked as newly created by this transaction.
+        # Configurations are retained for recovery, including a new installation.
+        # Delete only the binary/unit marked as created by this transaction.
         unit="/etc/systemd/system/$service"
         [[ ! -L "$unit" ]] || die 'New service file was replaced by a symlink; manual rollback is required.'
         if [[ $(metadata_get "$backup/new_unit") == yes ]];then
@@ -424,7 +492,6 @@ do_rollback() {
             rm -f -- "$unit"
         fi
         [[ $(metadata_get "$backup/new_binary") == yes ]] && rm -f -- "$binary"
-        [[ $(metadata_get "$backup/new_config") == yes ]] && rm -f -- "$config"
         systemctl daemon-reload
         # Service account and shared runtime/log directories are retained.
     else die 'Unknown transaction mode.';fi
@@ -483,12 +550,15 @@ deploy_agent() {
     metadata_set "$backup/mode" "$mode";metadata_set "$backup/binary" "$binary";metadata_set "$backup/config" "$config";metadata_set "$backup/service" "$service"
     metadata_set "$backup/was_active" "$was_active";metadata_set "$backup/version_before" "$current_version"
     metadata_set "$backup/new_binary" no;metadata_set "$backup/new_config" no;metadata_set "$backup/new_unit" no
+    metadata_set "$backup/config_directory_repaired" no
     snapshot_configs "$backup" "$config"
     validation_log="$backup/validation.log"
+    : >"$validation_log";chmod 0600 "$validation_log"
     if [[ "$mode" == update ]];then cp -a -- "$binary" "$backup/binary.previous";fi
     # EXIT also catches an explicit validation die(), not only set -e failures.
     # A rejected staged build must not restart an unchanged existing service.
     TX_MODE=$mode;TX_BACKUP=$backup;TX_BINARY_REPLACED=no;TX_STAGED=''
+    TX_SERVICE=$service;TX_CONFIG=$config;TX_VALIDATION_LOG=$validation_log;TX_DIAGNOSTICS_LOG="$backup/diagnostics.log";TX_ERROR=''
     trap 'deployment_exit "$?"' EXIT
     begin;emit backup "$backup"
     mkdir -p -- "$(dirname "$binary")"
@@ -506,10 +576,12 @@ deploy_agent() {
             useradd --system --gid zabbix --home-dir /var/lib/zabbix --no-create-home --shell "$nologin" zabbix
         fi
         if [[ "$new_config" == yes ]];then
-            mkdir -p -- "$(dirname "$config")"
+            preserve_prepared_config "$backup" "$supplied_config"
+            prepare_new_config_directory "$config" "$backup"
             metadata_set "$backup/new_config" yes
-            install -m 0640 -o root -g zabbix -- "$supplied_config" "$config"
+            install -m 0640 -o root -g zabbix -- "$backup/config.prepared" "$config" || die 'Cannot install the prepared configuration; its transaction backup is retained.'
         fi
+        ensure_config_directories "$config"
         local runtime_dir
         for runtime_dir in /var/log/zabbix /var/lib/zabbix;do
             [[ ! -L "$runtime_dir" ]] || die "Refusing a symlinked state/log directory: $runtime_dir"
@@ -551,9 +623,9 @@ UNIT
         chmod 0644 "$unit"
         systemctl daemon-reload
         systemctl enable "$service"
-        systemctl start "$service"
-    else systemctl restart "$service";fi
-    verify_running "$service" "$binary" "$version"
+        systemctl start "$service" >>"$TX_DIAGNOSTICS_LOG" 2>&1 || die 'Starting the new Agent 2 service failed. The configuration is retained; inspect the private service diagnostics log.'
+    else systemctl restart "$service" >>"$TX_DIAGNOSTICS_LOG" 2>&1 || die 'Restarting the updated Agent 2 service failed. Inspect the private service diagnostics log.';fi
+    verify_running "$service" "$binary" "$version" || die 'Agent 2 did not become healthy after deployment. Inspect the private service diagnostics log.'
     check_staged "$binary" "$config" "$version" "$variant" "$validation_log"
     trap - EXIT
     metadata_set "$backup/completed" yes
@@ -571,8 +643,27 @@ status_agent() {
 }
 
 # Functions embedded into the Agent 2 worker; no action runs on definition.
+resolve_include_pattern() {
+    local including_file=$1 value=$2 include probe component normalized=''
+    local -a components=()
+    [[ -n "$value" ]] || die 'An Include pattern is empty.'
+    include=$value
+    [[ "$include" == /* ]] || include="$(dirname -- "$including_file")/$include"
+    probe=${include//\*/};probe=${probe//\?/};probe=${probe//\[/};probe=${probe//\]/}
+    [[ "$probe" =~ ^/[A-Za-z0-9_./+:-]*$ ]] || die 'An Include pattern contains unsupported characters.'
+    # Normalize lexically so existing symlinks remain visible to the file checks.
+    IFS=/ read -r -a components <<<"$include"
+    for component in "${components[@]}";do
+        case "$component" in
+            ''|.) ;;
+            ..) normalized=${normalized%/*} ;;
+            *) normalized+="/$component" ;;
+        esac
+    done
+    printf '%s' "${normalized:-/}"
+}
 migration_config_walk() {
-    local file=$1 depth=$2 real line key value include match probe
+    local file=$1 depth=$2 real line key value include match
     ((depth <= 32)) || die 'Configuration Include nesting exceeds 32 levels.'
     safe_path "$file" && [[ -f "$file" && -r "$file" && ! -L "$file" ]] || die 'An Include/config path is unreadable, unsafe, or a symlink.'
     real=$(canonical "$file")
@@ -588,9 +679,9 @@ migration_config_walk() {
         value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         case "$key" in
             Include)
-                probe=${value//\*/}; probe=${probe//\?/}; probe=${probe//\[/}; probe=${probe//\]/}
-                safe_path "$probe" || die 'An Include pattern contains unsupported characters.'
-                include=$value
+                # Zabbix resolves every relative Include from the main config,
+                # including Includes encountered in an already included file.
+                include=$(resolve_include_pattern "$MIG_CONFIG_MAIN" "$value") || die 'Cannot resolve the configuration Include pattern.'
                 [[ ! -d "$include" ]] || include="${include%/}/*"
                 while IFS= read -r match; do
                     [[ -n "$match" ]] || continue
@@ -643,7 +734,7 @@ convert_config() {
     safe_path "$destination" && [[ "$destination" == "$root"/tmp/* && ! -L "$destination" ]] || die 'Converted configuration must be inside the private local tmp directory.'
     [[ -d "$root/tmp" && ! -L "$root/tmp" ]] || die 'Private tmp directory is missing.'
     raw=$(mktemp "$root/tmp/conversion.XXXXXXXX")
-    MIG_CONFIG_RAW=$raw; MIG_ACTIVE_ONLY=no
+    MIG_CONFIG_RAW=$raw; MIG_ACTIVE_ONLY=no; MIG_CONFIG_MAIN=$source
     declare -gA MIG_CONFIG_STACK=()
     migration_config_walk "$source" 0
     if [[ "$MIG_ACTIVE_ONLY" == yes ]];then
@@ -652,7 +743,7 @@ convert_config() {
     printf '\nPidFile=/run/zabbix-agent2-source/agent.pid\nControlSocket=/run/zabbix-agent2-source/agent.sock\nPluginSocket=/run/zabbix-agent2-source/plugin.sock\n' >>"$destination"
     chmod 0600 "$destination"
     rm -f -- "$raw"
-    unset MIG_CONFIG_RAW MIG_ACTIVE_ONLY MIG_CONFIG_STACK
+    unset MIG_CONFIG_RAW MIG_ACTIVE_ONLY MIG_CONFIG_MAIN MIG_CONFIG_STACK
     begin;emit converted_config "$destination"
 }
 migrate_rollback() {
@@ -669,12 +760,12 @@ migrate_rollback() {
         rm -f -- "$unit"
     fi
     if [[ $(metadata_get "$backup/new_binary") == yes ]];then rm -f -- "$binary";fi
-    if [[ $(metadata_get "$backup/new_config") == yes ]];then rm -f -- "$config";fi
+    # Retain the new Agent 2 configuration on both automatic and manual rollback.
     systemctl daemon-reload
     if [[ "$old_stopped" == yes ]];then
         case "$old_state" in enabled) systemctl enable "$old_service" >/dev/null;;enabled-runtime) systemctl enable --runtime "$old_service" >/dev/null;;disabled) systemctl disable "$old_service" >/dev/null;;esac
         if [[ "$old_active" == yes ]];then
-            systemctl restart "$old_service"
+            systemctl restart "$old_service" || die 'Restarting the classic agent during rollback failed.'
             verify_running "$old_service" "$old_binary" "$(metadata_get "$backup/version_before")" || die 'Classic agent rollback did not verify.'
         else systemctl stop "$old_service" || true;fi
     fi
@@ -717,9 +808,12 @@ migrate_agent() {
     metadata_set "$backup/old_binary" "$old_binary";metadata_set "$backup/old_config" "$old_config";metadata_set "$backup/old_service" "$old_service"
     metadata_set "$backup/old_active" "$old_active";metadata_set "$backup/old_enabled_state" "$old_state";metadata_set "$backup/old_stopped" no;metadata_set "$backup/version_before" "$old_version"
     metadata_set "$backup/new_binary" no;metadata_set "$backup/new_config" no;metadata_set "$backup/new_unit" no
+    metadata_set "$backup/config_directory_repaired" no
     snapshot_configs "$backup" "$old_config"
     [[ ! -f "$config" ]] || cp -a -- "$config" "$backup/config.target.previous"
     TX_MODE=migrate;TX_BACKUP=$backup;TX_BINARY_REPLACED=no;TX_STAGED=''
+    TX_SERVICE=$service;TX_CONFIG=$config;TX_VALIDATION_LOG="$backup/validation.log";TX_DIAGNOSTICS_LOG="$backup/diagnostics.log";TX_ERROR=''
+    : >"$TX_VALIDATION_LOG";chmod 0600 "$TX_VALIDATION_LOG"
     trap 'deployment_exit "$?"' EXIT
     begin;emit backup "$backup"
     if [[ ! -f "$config" ]];then
@@ -734,8 +828,14 @@ migrate_agent() {
         [[ -x "$nologin" ]] || nologin=/sbin/nologin
         useradd --system --gid zabbix --home-dir /var/lib/zabbix --no-create-home --shell "$nologin" zabbix
     fi
-    mkdir -p -- "$(dirname "$binary")" "$(dirname "$config")"
-    if [[ ! -f "$config" ]];then metadata_set "$backup/new_config" yes;install -m 0640 -o root -g zabbix -- "$supplied" "$config";fi
+    mkdir -p -- "$(dirname "$binary")"
+    if [[ ! -f "$config" ]];then
+        preserve_prepared_config "$backup" "$supplied"
+        prepare_new_config_directory "$config" "$backup"
+        metadata_set "$backup/new_config" yes
+        install -m 0640 -o root -g zabbix -- "$backup/config.prepared" "$config" || die 'Cannot install the prepared Agent 2 configuration; its transaction backup is retained.'
+    fi
+    ensure_config_directories "$config"
     for runtime_dir in /var/log/zabbix /var/lib/zabbix;do
         [[ ! -L "$runtime_dir" ]] || die 'A log/state directory is a symlink.'
         [[ -d "$runtime_dir" ]] || install -d -m 0750 -o zabbix -g zabbix "$runtime_dir"
@@ -772,7 +872,7 @@ UNIT
     systemctl stop "$old_service"
     systemctl disable "$old_service" >/dev/null
     systemctl enable "$service" >/dev/null
-    systemctl start "$service"
+    systemctl start "$service" >>"$TX_DIAGNOSTICS_LOG" 2>&1 || die 'Starting Agent 2 after migration failed. The configuration is retained; inspect the private service diagnostics log.'
     verify_running "$service" "$binary" "$version" || die 'New Agent 2 did not become healthy.'
     check_staged "$binary" "$config" "$version" agent2 "$backup/validation.log"
     trap - EXIT
@@ -973,7 +1073,7 @@ init_work() {
     [[ $(stat -c %a -- "$WORK") == 700 ]] || { fail 'У существующего рабочего каталога должны быть права 0700.'; return 1; }
   else mkdir -m 0700 -- "$WORK"; fi
   local dir
-  for dir in sources builds deps logs backups reports tmp go toolchains; do
+  for dir in sources builds deps logs backups reports tmp go toolchains configs; do
     [[ ! -L "$WORK/$dir" ]] || { fail "Символическая ссылка в рабочем каталоге: $dir"; return 1; }
     mkdir -p -- "$WORK/$dir"; chmod 700 "$WORK/$dir"
   done
@@ -994,6 +1094,7 @@ refresh_audit() {
   [[ "$AUDIT" == ZA_AUDIT_V1$'\n'* ]] || { fail 'Не получен корректный анализ системы.'; return 1; }
 }
 display_audit() {
+  say "Версия скрипта: $SCRIPT_REVISION"
   local key value
   say "Каталог запуска: $LAUNCH_DIR"
   say "Исходники, зависимости, сборки, отчёты и backup: $WORK"
@@ -1187,6 +1288,40 @@ artifact_ready() {
   done
 }
 selected() { local value; value=$(option "$1"); [[ -n "$value" ]] || value=$(field "$AUDIT" "$1"); printf '%s' "$value"; }
+register_config_source() {
+  local source=$1 digest destination staged
+  [[ -f "$source" && -r "$source" && -s "$source" && ! -L "$source" ]] || { fail 'use-config: нужен непустой читаемый обычный файл, не символическая ссылка.'; return 1; }
+  init_work
+  digest=$(sha256sum <"$source" | awk '{print $1}')
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || { fail 'Не удалось вычислить SHA-256 конфига.'; return 1; }
+  destination="$WORK/configs/provided-$digest.conf"
+  staged=$(mktemp "$WORK/tmp/config-source.XXXXXXXX")
+  cp -- "$source" "$staged"
+  chmod 0600 "$staged"
+  if [[ $(sha256sum <"$staged" | awk '{print $1}') != "$digest" ]]; then
+    rm -f -- "$staged"; fail 'Исходный конфиг изменился во время копирования. Повторите use-config.'; return 1
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    if [[ -L "$destination" || ! -f "$destination" || $(sha256sum <"$destination" | awk '{print $1}') != "$digest" ]]; then
+      rm -f -- "$staged"; fail 'Сохранённая копия конфига повреждена или подменена. Проверьте рабочую папку.'; return 1
+    fi
+    rm -f -- "$staged"
+  else mv -- "$staged" "$destination"; fi
+  put_option config_source "$destination"
+  put_option config_source_sha "$digest"
+  say "Готовый конфиг сохранён: $destination"
+  say 'apply использует его, только если целевой конфиг отсутствует. Существующий конфиг не перезаписывается.'
+}
+copy_config_source() {
+  local destination=$1 source digest
+  source=$(option config_source); digest=$(option config_source_sha)
+  [[ "$source" == "$WORK/configs/provided-"*.conf && -f "$source" && ! -L "$source" && "$digest" =~ ^[a-f0-9]{64}$ ]] || { fail 'Не найдена корректная копия use-config. Повторите use-config FILE.'; return 1; }
+  [[ $(sha256sum <"$source" | awk '{print $1}') == "$digest" ]] || { fail 'Контрольная сумма сохранённого конфига изменилась. Проверьте файл и повторите use-config.'; return 1; }
+  [[ "$destination" == "$WORK/tmp/"* && -f "$destination" && ! -L "$destination" ]] || { fail 'Некорректный временный путь конфига.'; return 1; }
+  cp -- "$source" "$destination"
+  chmod 0600 "$destination"
+  [[ $(sha256sum <"$destination" | awk '{print $1}') == "$digest" ]] || { fail 'Конфиг изменился при подготовке. Его временная копия сохранена для проверки.'; return 1; }
+}
 new_config() {
   local destination=$1 server active hostname
   read_tty server 'Server (разрешённый сервер/proxy пассивных проверок; пусто для active-only): '
@@ -1252,7 +1387,8 @@ deploy() {
   [[ -n "$binary" && -n "$config" && -n "$service" ]] || { fail 'Не определены binary/config/service. Задайте их командами set.'; return 1; }
   printf '\nПлан: %s Zabbix Agent 2 %s на %s\nБинарник: %s\nКонфиг: %s\nСлужба: %s\n' "$mode" "$TARGET_VERSION" "$(hostname)" "$binary" "$config" "$service"
   say "Перед сборкой будут установлены APT-зависимости; готовый Go и исходники останутся в $WORK."
-  if [[ -f "$config" ]]; then say 'Существующий конфиг будет сохранён и использован без перезаписи.'; fi
+  if [[ -f "$config" ]]; then say 'Существующий конфиг будет сохранён и использован без перезаписи.'
+  elif [[ -n $(option config_source) ]]; then say "Для отсутствующего конфига будет использована копия: $(option config_source)"; fi
   confirm "$(hostname)"
   # The user command and hostname confirmation authorize APT prerequisites and deployment.
   prepare_packages
@@ -1260,7 +1396,10 @@ deploy() {
     if ! archives_ready; then prepare yes; fi
     build_agent
   fi
-  if [[ "$mode" == install && ! -f "$config" ]]; then
+  if [[ ! -f "$config" && ( "$mode" == install || "$mode" == migrate ) && -n $(option config_source) ]]; then
+    supplied=$(mktemp "$WORK/tmp/new-config.XXXXXXXX")
+    copy_config_source "$supplied"
+  elif [[ "$mode" == install && ! -f "$config" ]]; then
     supplied=$(mktemp "$WORK/tmp/new-config.XXXXXXXX")
     if [[ -n "$orphan_classic" ]]; then
       run_worker convert-config "$orphan_classic" "$supplied" >"$WORK/logs/config-conversion.tsv"
@@ -1282,8 +1421,17 @@ deploy() {
     printf '%s\n' "$result" >"$WORK/logs/deploy-failed.tsv"
     backup=$(field "$result" backup)
     [[ -z "$backup" ]] || put_option backup "$backup"
-    [[ -z "$supplied" ]] || rm -f -- "$supplied"
-    fail "$(field "$result" error) Смотрите журнал $WORK/logs/deploy-failed.tsv; backup: $(option backup)"; return 1
+    local reason key value
+    reason=$(field "$result" error)
+    fail "${reason:-Установка не завершена. Проверьте сохранённые журналы.}" || true
+    for key in config validation_log diagnostics_log prepared_config; do
+      value=$(field "$result" "$key")
+      [[ -z "$value" ]] || say "$key: $value"
+    done
+    [[ -z "$supplied" ]] || say "Подготовленный входной конфиг сохранён: $supplied"
+    say "Резервная копия: ${backup:--}"
+    say "Протокол операции: $WORK/logs/deploy-failed.tsv"
+    return 1
   fi
   [[ -z "$supplied" ]] || rm -f -- "$supplied"
 }
@@ -1312,9 +1460,11 @@ rollback() {
   say "Статус: $(field "$result" status)"
 }
 help_text() {
+  say "Версия скрипта: $SCRIPT_REVISION"
   cat <<'HELP'
 Локальный Agent2: запуск на самом COD через RDP, без SSH/Ansible.
 Без аргументов: только анализ, затем меню. Анализ не ставит пакеты и не меняет службу.
+  --version / version                 версия самого скрипта
   analyze / --analyze / audit / plan   только анализ
   report                              сохранить анализ
   prepare                             APT-зависимости, исходники Zabbix и готовый Go
@@ -1323,6 +1473,8 @@ help_text() {
                                       apply сам выбирает install/update/миграцию
   source FILE.tar.gz SHA256            зарегистрировать исходный архив Zabbix
   fetch zabbix HTTPS_URL SHA256        скачать исходный архив Zabbix с проверкой
+  use-config FILE                     сохранить готовый конфиг для отсутствующего
+                                      целевого файла; существующий не заменяется
   set binary /absolute/path           явный путь существующего бинарника
   set config /absolute/path           явный старый конфиг
   set service NAME.service            явная существующая служба
@@ -1345,7 +1497,9 @@ Go скачивается готовым официальным архивом �
 После build работающая служба не заменяется; установка выполняется по apply.
 Старый конфиг Agent2 сохраняется. Классический агент мигрируется с backup/откатом;
 LoadModule требует отдельной подготовки. Политики и защиты Astra не отключаются.
-Откат восстанавливает агент и службу; установленные APT-зависимости остаются.
+Откат восстанавливает агент и службу; конфиги и APT-зависимости остаются.
+Подготовленный конфиг сохраняется в backup/config.prepared до установки.
+При сбое показываются пути validation.log, diagnostics.log и сохранённого конфига.
 HELP
 }
 guide_text() {
@@ -1363,12 +1517,12 @@ guide_text() {
 
 ```bash
 cd /home/rcodaib/tmp
-bash ./zabbix_agent2_local.sh
+bash ./zabbix_agent2_local_fixed_20261126.sh
 ```
 
 Первый запуск выполняет только анализ и открывает меню. Анализ не устанавливает
 пакеты, не скачивает Go, не создаёт рабочую папку и не перезапускает службу.
-Отдельный анализ без меню: `bash zabbix_agent2_local.sh --analyze`.
+Отдельный анализ без меню: `bash zabbix_agent2_local_fixed_20261126.sh --analyze`.
 
 ## Основные команды
 
@@ -1444,6 +1598,7 @@ Zabbix; GOPROXY/GOSUMDB выключены. Кеши и временные фа�
 | tmp | Временные файлы |
 | logs, reports | Журналы операций и сохранённый анализ |
 | backups | Резервные копии и сведения для отката |
+| configs | Точные копии конфигов, переданных командой use-config |
 
 Системные пакеты APT устанавливаются в штатные пути ОС. Установленные агент,
 конфиг и служба также находятся по штатным системным путям. Старые результаты
@@ -1470,25 +1625,51 @@ LoadModule, нестандартный пользователь, AllowRoot=1, н
 Если конфига нет, запрашиваются Server, ServerActive и Hostname. Для active-only
 параметр Server не записывается, StartAgents в конфиг Agent2 не добавляется.
 
+Чтобы восстановить заранее подготовленный полный конфиг, выполните:
+
+```bash
+bash ./zabbix_agent2_local_fixed_20261126.sh use-config ./COD07.conf
+bash ./zabbix_agent2_local_fixed_20261126.sh apply
+```
+
+Команда `use-config` сохраняет точную приватную копию файла и её SHA-256.
+`apply` использует эту копию только при отсутствии целевого конфига. Если файл
+уже существует, он не перезаписывается. Include-файлы нужно восстанавливать
+отдельно из прежней резервной копии; один основной конфиг их не заменяет.
+Относительный Include в основном конфиге поддерживается.
+При новой установке создаются отсутствующие стандартные каталоги
+`zabbix_agent2.d/plugins.d`, существующие файлы и права каталогов не меняются.
+Исключение для восстановления после старого установщика: пустой стандартный
+`/etc/zabbix`, принадлежащий root:root с правами 0700, получает root:zabbix и 0750,
+чтобы служба могла прочитать конфиг. Это отмечается в резервной копии операции.
+Права непустого каталога или нестандартного пути автоматически не меняются.
+
 Для уточнения путей доступны `set binary /absolute/path`, `set config /absolute/path`
 и `set service NAME.service`. `report` сохраняет читаемый анализ.
 
 Откат относится к агенту и службе. Предварительно установленные пакеты сборки
-автоматически не удаляются. Защиты/подписи/политики Astra не отключаются.
+автоматически не удаляются. Конфиг остаётся на месте даже при ошибке новой
+установки. До его записи сохраняется `backups/transaction.*/config.prepared`.
+При ошибке показываются пути к приватным `validation.log` и `diagnostics.log`;
+второй содержит состояние службы и последние записи её журнала до отката.
+Входной временный конфиг после ошибки также сохраняется. Конфиги могут содержать
+секреты: не публикуйте целиком конфиги или журналы. Защиты/подписи/политики Astra не отключаются.
 После обновления проверьте `agent.version` и поступление данных на сервере Zabbix.
 
-Полная инструкция: `bash zabbix_agent2_local.sh guide`.
+Полная инструкция: `bash zabbix_agent2_local_fixed_20261126.sh guide`.
 ZABBIX_AGENT2_READY_GUIDE_20261125
 }
 dispatch() {
   local command=${1-help}; [[ $# -eq 0 ]] || shift
   case "$command" in
     analyze|--analyze|audit|plan) [[ $# -eq 0 ]] || return 1; analyze ;;
+    version|--version) [[ $# -eq 0 ]] || return 1; say "$SCRIPT_REVISION" ;;
     help|--help|-h) help_text ;;
     guide) guide_text ;;
     source) [[ $# -eq 2 ]] || { fail 'source FILE SHA256'; return 1; }; register_archive zabbix "$@" ;;
     dependency|build-deps) fail 'Библиотеки теперь устанавливаются через APT. Используйте prepare или build.' ;;
     fetch) [[ $# -eq 3 ]] || { fail 'fetch zabbix HTTPS_URL SHA256'; return 1; }; fetch_archive "$@" ;;
+    use-config) [[ $# -eq 1 ]] || { fail 'use-config FILE'; return 1; }; register_config_source "$1" ;;
     prepare) [[ $# -eq 0 ]] || return 1; prepare ;;
     build) [[ $# -eq 0 ]] || return 1; build_agent ;;
     install|update|apply) [[ $# -eq 0 ]] || return 1; deploy "$command" ;;
